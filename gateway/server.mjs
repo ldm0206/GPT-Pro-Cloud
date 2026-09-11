@@ -50,6 +50,8 @@ const seats = createSeatRegistry({ cap: parseTabSeatCap(process.env.TAB_SEATS_MA
 const jails = createSeatJailRegistry();
 const sessions = createSessionStore({ file: join(dirname(USERS_FILE), "sessions.json"), ttlMs: TTL_MS });
 const liveSockets = createSocketHub();
+// deskId → userId → Set<socket>: VNC sockets per desk, so seat release stays per-desk
+const vncSockets = new Map();
 const seatWss = new WebSocketServer({ noServer: true });
 const loginLimiter = createLoginLimiter({ maxFails: 10, windowMs: 15 * 60 * 1000 });
 const deskCdpLocks = new Map();
@@ -964,7 +966,54 @@ server.on("upgrade", (req, socket, head) => {
   if (VNC_PASSWORD) {
     req.headers.authorization = `Basic ${Buffer.from(`${VNC_USER}:${VNC_PASSWORD}`).toString("base64")}`;
   }
+  // Exclusive-VNC bookkeeping: a dropped socket must free the seat, and noVNC's
+  // auto-reconnect (which never re-runs /open) must get it back.
+  if (!users.deskCdpOn(desk.id)) {
+    const mine = seats.ofUser(desk.id, sess.user.id);
+    const occupied =
+      seats.list(desk.id).some((s) => s.userId !== sess.user.id) ||
+      presence.list(desk.id).some((v) => v.id !== sess.user.id);
+    if (!mine && occupied) {
+      socket.write("HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+  }
   liveSockets.add(sess.user.id, socket);
+  let perUser = vncSockets.get(desk.id);
+  if (!perUser) {
+    perUser = new Map();
+    vncSockets.set(desk.id, perUser);
+  }
+  let mySockets = perUser.get(sess.user.id);
+  if (!mySockets) {
+    mySockets = new Set();
+    perUser.set(sess.user.id, mySockets);
+  }
+  mySockets.add(socket);
+  socket.on("close", () => {
+    mySockets.delete(socket);
+    if (mySockets.size > 0) return;
+    perUser.delete(sess.user.id);
+    if (!perUser.size) vncSockets.delete(desk.id);
+    for (const seat of seats.list(desk.id)) {
+      if (seat.userId === sess.user.id && seat.mode === "vnc") {
+        seats.release(seat.id);
+        presence.leave(desk.id, sess.user.id);
+        console.log(`vnc seat released on disconnect desk=${desk.id} user=${sess.user.username}`);
+      }
+    }
+  });
+  if (!users.deskCdpOn(desk.id)) {
+    const mine = seats.ofUser(desk.id, sess.user.id);
+    if (mine) {
+      seats.beat(mine.id);
+    } else {
+      seats.claim(desk.id, sess.user, { mode: "vnc" });
+      presence.beat(desk.id, sess.user);
+      console.log(`vnc seat reclaimed on reconnect desk=${desk.id} user=${sess.user.username}`);
+    }
+  }
   proxy.ws(req, socket, head, { target: desk.target });
 });
 
