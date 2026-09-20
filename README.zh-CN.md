@@ -104,7 +104,9 @@ Cloud / CI 虚拟机往往不跑桌面镜像，无法证明 Chromium 是活的�
 
 ## 剪贴板
 
-独占 VNC 路径上，剪贴板在本机和桌面之间是双向的，文字和截图都可以（gpc-clipd / xclip），不依赖调试口。
+独占 VNC 路径上，剪贴板在本机和桌面之间是双向的，文字、截图，以及 ChatGPT 网页里点复制的生成图都可以（gpc-clipd / xclip；生成图走页面剪贴板，避免再注入一次 Ctrl+C 把 PNG 冲掉），不依赖调试口。
+
+桌面 Chromium 里下载的文件留在容器内（`/config/gpc-downloads`）。网关不转发 Kasm 的网页 Downloads 目录和 kclient `/files`——在 ChatGPT 里点下载，不会存到观看者自己的电脑上。
 
 分屏席位只在该账号开启「多人分屏 / CDP」后才有。它们不能走 X11 剪贴板中继——整台桌面只有一块剪贴板，无法按标签页隔离。文字走 CDP `Input.insertText`，图片（png/jpeg/webp）在当前焦点元素上派发合成的 `ClipboardEvent`。先点一下输入框；没有焦点时界面会提示「点一下输入框再粘贴」。不会写入整桌 X11 剪贴板。
 

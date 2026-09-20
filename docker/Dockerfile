@@ -46,6 +46,7 @@ COPY identity.sh /custom-cont-init.d/00-identity
 COPY update-autostart.sh /custom-cont-init.d/01-autostart
 COPY proxy-init.sh /custom-cont-init.d/02-proxy
 COPY hide-kasm.sh /custom-cont-init.d/03-hide-kasm
+COPY no-file-leak.sh /custom-cont-init.d/04-no-file-leak
 COPY clipd.py /usr/local/bin/gpc-clipd
 COPY cdp-fwd.py /usr/local/bin/gpc-cdp-fwd
 COPY autostart /defaults/autostart
@@ -53,6 +54,7 @@ RUN chmod 755 /custom-cont-init.d/00-identity \
               /custom-cont-init.d/01-autostart \
               /custom-cont-init.d/02-proxy \
               /custom-cont-init.d/03-hide-kasm \
+              /custom-cont-init.d/04-no-file-leak \
               /usr/local/bin/gpc-clipd \
               /usr/local/bin/gpc-cdp-fwd \
               /defaults/autostart

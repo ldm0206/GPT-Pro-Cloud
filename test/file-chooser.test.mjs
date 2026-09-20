@@ -56,6 +56,15 @@ describe("exclusive VNC local file apply", () => {
       },
     });
     assert.equal(calls.some((c) => c.method === "Page.setInterceptFileChooserDialog" && c.params.enabled === true), true);
+    assert.equal(
+      calls.some(
+        (c) =>
+          (c.method === "Browser.setDownloadBehavior" || c.method === "Page.setDownloadBehavior") &&
+          c.params.behavior === "allow" &&
+          /gpc-downloads/.test(c.params.downloadPath || ""),
+      ),
+      true,
+    );
     listeners[0]({
       method: "Page.fileChooserOpened",
       sessionId: "s1",

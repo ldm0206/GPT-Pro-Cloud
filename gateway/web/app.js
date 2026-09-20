@@ -429,7 +429,7 @@ function renderSettings() {
     <section class="panel">
       <div class="panel-head">
         <b>复制粘贴</b>
-        <em>在桌面画面里直接 ⌘C / ⌘V，双向生效。独占 VNC 走整桌剪贴板（文字和截图）。</em>
+        <em>在桌面画面里直接 ⌘C / ⌘V，双向生效。独占 VNC 走整桌剪贴板（文字、截图、ChatGPT 生成图）。桌面里下载的文件留在容器内，不会存到你电脑上。</em>
       </div>
     </section>
     <section class="panel">
@@ -500,18 +500,30 @@ function setChip(kind, text) {
   chip.title = `${MOD}+V 贴进来`;
 }
 
+function imageFp(buf) {
+  const u = buf instanceof Uint8Array ? buf : new Uint8Array(buf || []);
+  if (u.length < 24) return "";
+  return `${u.length}:${u[0]}:${u[16]}:${u[u.length >> 1]}:${u[u.length - 1]}`;
+}
+
 async function writeToLocal(text, imageBlob) {
   try {
     if (imageBlob && navigator.clipboard?.write && window.ClipboardItem) {
-      await navigator.clipboard.write([new ClipboardItem({ [imageBlob.type || "image/png"]: imageBlob })]);
-      return true;
+      const png = imageBlob.type === "image/png" ? imageBlob : new Blob([imageBlob], { type: "image/png" });
+      try {
+        await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
+        return true;
+      } catch {
+        await navigator.clipboard.write([new ClipboardItem({ [imageBlob.type || "image/png"]: imageBlob })]);
+        return true;
+      }
     }
     if (text && navigator.clipboard?.writeText) {
       await navigator.clipboard.writeText(text);
       return true;
     }
   } catch {
-    /* http / permission */
+    /* http / permission — image write needs a user gesture; chip click supplies it */
   }
   if (!text) return false;
   try {
@@ -525,6 +537,23 @@ async function writeToLocal(text, imageBlob) {
     const ok = document.execCommand("copy");
     ta.remove();
     return ok;
+  } catch {
+    return false;
+  }
+}
+
+async function writeCopyFetchToLocal(pending) {
+  if (!navigator.clipboard?.write || !window.ClipboardItem) return false;
+  try {
+    await navigator.clipboard.write([
+      new ClipboardItem({
+        "image/png": pending.then(({ mime, buf }) => {
+          if (!String(mime).startsWith("image/")) throw new Error("not-image");
+          return new Blob([buf], { type: "image/png" });
+        }),
+      }),
+    ]);
+    return true;
   } catch {
     return false;
   }
@@ -929,8 +958,20 @@ function bindDesk() {
       }
       if (!r.ok) return;
       const mime = r.headers.get("content-type") || "";
-      if (!mime.startsWith("text/")) return;
-      const text = (await r.text()).trim();
+      const buf = await r.arrayBuffer();
+      if (String(mime).startsWith("image/") && buf.byteLength > 24) {
+        const fp = imageFp(buf);
+        if (fp && lastPeeked === fp) return;
+        lastPeeked = fp;
+        if (lastThumb) URL.revokeObjectURL(lastThumb);
+        const blob = new Blob([buf], { type: mime });
+        lastThumb = URL.createObjectURL(blob);
+        lastClip = { kind: "image", body: buf, mime, text: "", thumb: lastThumb };
+        setChip("image");
+        return;
+      }
+      if (!String(mime).startsWith("text/")) return;
+      const text = new TextDecoder().decode(buf).trim();
       if (isShareLink(text)) await adoptDeskText(text);
     } catch {
       /* ignore */
@@ -1084,28 +1125,38 @@ async function sendDeskPaste(body, mime) {
   return { ok: true };
 }
 
-async function copyFromDesk() {
+async function copyFromDesk(fromGesture = false) {
   const id = state.deskId;
   if (!id) return false;
   setChip("copying");
-  const r = await fetch(`/api/desks/${id}/copy`, { method: "POST", credentials: "same-origin" });
-  if (!r.ok) {
+  const pending = fetch(`/api/desks/${id}/copy`, { method: "POST", credentials: "same-origin" }).then(async (r) => {
+    if (!r.ok) throw new Error("没复制到");
+    const mime = r.headers.get("content-type") || "text/plain";
+    const buf = await r.arrayBuffer();
+    return { mime, buf };
+  });
+  let wrote = fromGesture ? await writeCopyFetchToLocal(pending) : false;
+  let payload;
+  try {
+    payload = await pending;
+  } catch {
     setChip("waiting");
     toast("没复制到");
     return false;
   }
-  const mime = r.headers.get("content-type") || "text/plain";
-  const buf = await r.arrayBuffer();
-  if (mime.startsWith("image/")) {
+  const mime = payload.mime;
+  const buf = payload.buf;
+  if (String(mime).startsWith("image/")) {
     const blob = new Blob([buf], { type: mime });
     const file = new File([blob], "image.png", { type: mime });
     if (lastThumb) URL.revokeObjectURL(lastThumb);
     lastThumb = URL.createObjectURL(file);
     lastClip = { kind: "image", body: buf, mime, text: "", thumb: lastThumb };
+    lastPeeked = imageFp(buf);
     setChip("image");
-    const ok = await writeToLocal("", blob);
-    toast(ok ? "图片已复制到本机" : "已记下图片，点顶栏图标拷到本机", "image");
-    return ok;
+    if (!wrote) wrote = await writeToLocal("", blob);
+    toast(wrote ? "图片已复制到本机" : "已记下图片，点顶栏图标拷到本机", "image");
+    return wrote;
   }
   const text = new TextDecoder().decode(buf);
   if (!text) {
@@ -1115,10 +1166,10 @@ async function copyFromDesk() {
   }
   lastClip = { kind: "text", body: text, mime: "text/plain; charset=utf-8", text, thumb: "" };
   setChip("text", text);
-  const ok = await writeToLocal(text, null);
+  if (!wrote) wrote = await writeToLocal(text, null);
   const preview = text.replace(/\s+/g, " ").trim().slice(0, 18);
-  toast(ok ? `已复制到本机「${preview}${text.trim().length > 18 ? "…" : ""}」` : "已记下，点顶栏即可拷到本机");
-  return ok;
+  toast(wrote ? `已复制到本机「${preview}${text.trim().length > 18 ? "…" : ""}」` : "已记下，点顶栏即可拷到本机");
+  return wrote;
 }
 
 function bindClipboard(iframe) {
@@ -1189,7 +1240,7 @@ function bindClipboard(iframe) {
       if (isCopyChord(e)) {
         e.preventDefault();
         e.stopImmediatePropagation();
-        copyFromDesk().catch(() => {});
+        copyFromDesk(true).catch(() => {});
         return;
       }
       if (!isPasteChord(e)) return;
@@ -1292,7 +1343,7 @@ function bindTabClipboard() {
       if (state.view !== "desk" || state.deskMode !== "tab") return;
       if (!isCopyChord(e)) return;
       e.preventDefault();
-      copyFromDesk().catch(() => {});
+      copyFromDesk(true).catch(() => {});
     },
     true,
   );

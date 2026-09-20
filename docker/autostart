@@ -103,6 +103,8 @@ while true; do
     # Target.createTarget (new window, parked off-screen). Members stream the
     # page viewport via CDP, so they never see the tab strip. First-time login
     # still uses this primary --app window over VNC.
+    mkdir -p /config/gpc-downloads
+    export XDG_DOWNLOAD_DIR=/config/gpc-downloads
     echo "[autostart] 启动 Chromium → ${START_URL}"
     /usr/bin/chromium \
         --no-sandbox \
@@ -115,6 +117,7 @@ while true; do
         --disable-gpu \
         --force-device-scale-factor=1 \
         --disable-background-networking \
+        --download-default-directory=/config/gpc-downloads \
         --user-data-dir=/config/chromium \
         ${CDP_FLAGS} \
         --app="${START_URL}" \

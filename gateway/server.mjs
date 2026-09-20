@@ -10,14 +10,15 @@ import { createDockerClient, deskContainerName, ensureDeskContainer, removeDeskC
 import { createUserStore } from "../lib/users.mjs";
 import { createPresence } from "../lib/presence.mjs";
 import { createSocketHub, kickLiveSession } from "../lib/kick.mjs";
-import { evaluateInDesk, waitForDesk, peekClipboard, isShareUrl, SHARE_CLICK, TAB_CLIP_READ, READ_PROJECT_URL, projectOnboardScript, listSeatProjectLinks, sleep } from "../lib/chrome.mjs";
+import { evaluateInDesk, waitForDesk, peekClipboard, grabDeskClipboard, isShareUrl, SHARE_CLICK, TAB_CLIP_READ, PAGE_CLIP_READ, interpretPageClip, READ_PROJECT_URL, projectOnboardScript, listSeatProjectLinks, sleep } from "../lib/chrome.mjs";
+import { isDeskOutboundFilePath } from "../lib/desk-clipboard.mjs";
 import { applyDeskProxyLive, applyDeskProxiesLive } from "../lib/proxy.mjs";
 import { createSeatRegistry, parseTabSeatCap, publicSeat } from "../lib/seats.mjs";
 import { applyDeskCdpLive, attachSeatTarget, closeTarget, createParkedChatGPTTab, deskBrowserWs, evaluateOnTarget, forgetDeskBrowser, listDeskTargets, targetExists } from "../lib/cdp.mjs";
 import { createSeatJailRegistry, navigateSeatToUrl, pickNamedProjectHref, projectUrlFromOnboard, seatStartUrl } from "../lib/project-jail.mjs";
 import { startSeatScreencast } from "../lib/screencast.mjs";
 import { applyTabPastePlan, tabPastePlan } from "../lib/tab-paste.mjs";
-import { applyDeskUpload, armFileChooser, createChooserRegistry, FILE_TOO_BIG, FILE_UPLOAD_FAIL } from "../lib/file-chooser.mjs";
+import { applyDeskUpload, armFileChooser, createChooserRegistry, FILE_TOO_BIG, FILE_UPLOAD_FAIL, keepDeskDownloadsInside } from "../lib/file-chooser.mjs";
 import { stageDeskUpload } from "../lib/desk-files.mjs";
 import { WebSocketServer } from "ws";
 
@@ -237,6 +238,7 @@ async function watchExclusiveFileChooser(deskId, user) {
   const targetId = await findChatGptTargetId(deskId);
   if (!targetId) return;
   const attached = await attachSeatTarget(deskId, targetId);
+  await keepDeskDownloadsInside((method, params) => attached.cdp.send(method, params));
   const armed = await armFileChooser({
     send: (method, params, sid) => attached.cdp.send(method, params, sid ?? attached.sessionId),
     on: (fn) => attached.cdp.on(fn),
@@ -731,9 +733,11 @@ async function handleApi(req, res, url, sess) {
     const tab = seats.ofUser(id, sess.user.id);
     if (tab?.mode === "tab") {
       try {
-        const text = await evaluateOnTarget(id, tab.targetId, TAB_CLIP_READ);
-        const buf = Buffer.from(String(text || ""), "utf8");
-        res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+        const raw = await evaluateOnTarget(id, tab.targetId, PAGE_CLIP_READ);
+        const parsed = interpretPageClip(raw);
+        const buf = parsed?.buf || Buffer.from(String(raw || ""), "utf8");
+        const ct = parsed?.mime || "text/plain; charset=utf-8";
+        res.writeHead(200, { "content-type": ct, "cache-control": "no-store" });
         res.end(buf);
         return;
       } catch {
@@ -741,12 +745,10 @@ async function handleApi(req, res, url, sess) {
       }
     }
     try {
-      const r = await fetch(`http://desktop-${id}:18790/grab`, { method: "POST" });
-      if (!r.ok) return json(res, 502, { error: "无法复制" });
-      const buf = Buffer.from(await r.arrayBuffer());
-      const ct = r.headers.get("content-type") || "text/plain; charset=utf-8";
+      const got = await grabDeskClipboard(id);
+      const ct = got.mime || (got.kind === "image" ? "image/png" : "text/plain; charset=utf-8");
       res.writeHead(200, { "content-type": ct, "cache-control": "no-store" });
-      res.end(buf);
+      res.end(got.buf || Buffer.alloc(0));
       return;
     } catch {
       return json(res, 502, { error: "无法复制" });
@@ -759,9 +761,11 @@ async function handleApi(req, res, url, sess) {
     const tab = seats.ofUser(id, sess.user.id);
     if (tab?.mode === "tab") {
       try {
-        const text = await evaluateOnTarget(id, tab.targetId, TAB_CLIP_READ);
-        const buf = Buffer.from(String(text || ""), "utf8");
-        res.writeHead(200, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+        const raw = await evaluateOnTarget(id, tab.targetId, PAGE_CLIP_READ);
+        const parsed = interpretPageClip(raw);
+        const buf = parsed?.buf || Buffer.from(String(raw || ""), "utf8");
+        const ct = parsed?.mime || "text/plain; charset=utf-8";
+        res.writeHead(200, { "content-type": ct, "cache-control": "no-store" });
         res.end(buf);
         return;
       } catch {
@@ -912,6 +916,11 @@ async function handle(req, res) {
     json(res, 403, { error: "请先选择账号" });
     return;
   }
+  if (isDeskOutboundFilePath(url.pathname)) {
+    res.writeHead(404, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+    res.end("not found");
+    return;
+  }
   proxy.web(req, res, { target: desk.target });
 }
 
@@ -960,6 +969,11 @@ server.on("upgrade", (req, socket, head) => {
   const desk = deskId && registry.get(deskId);
   if (!desk || !users.canOpen(sess.user, desk.id)) {
     socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+  if (isDeskOutboundFilePath(url.pathname)) {
+    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
     socket.destroy();
     return;
   }

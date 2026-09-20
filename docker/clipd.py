@@ -47,38 +47,78 @@ def env() -> dict[str, str]:
     return out
 
 
+IMAGE_TARGETS = (
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/webp",
+    "image/bmp",
+)
+
+
+def _looks_like_image(data: bytes) -> str:
+    if len(data) < 24:
+        return ""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:2] == b"BM":
+        return "image/bmp"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
+
+
 def clip_out() -> tuple[str, bytes]:
     e = env()
     targets = subprocess.run(
         ["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"],
         capture_output=True,
         env=e,
-        timeout=3,
+        timeout=1,
         check=False,
     ).stdout.decode("utf-8", "replace")
-    if "image/png" in targets or "image/jpeg" in targets:
-        mime = "image/png" if "image/png" in targets else "image/jpeg"
+    wanted = [m for m in IMAGE_TARGETS if m in targets]
+    # TARGETS is sometimes empty even when Chromium holds a PNG. Probe png once
+    # only then — a complete TARGETS list without image/* is text.
+    probe = wanted or (("image/png",) if not targets.strip() else ())
+    for mime in probe:
         img = subprocess.run(
             ["xclip", "-selection", "clipboard", "-t", mime, "-o"],
             capture_output=True,
             env=e,
-            timeout=5,
+            timeout=1,
             check=False,
         ).stdout
-        if img:
-            return mime, img
+        if not img:
+            continue
+        sniffed = _looks_like_image(img)
+        if sniffed:
+            return sniffed, img
+        if mime.startswith("image/") and len(img) > 24:
+            return ("image/jpeg" if mime == "image/jpg" else mime), img
     text = subprocess.run(
         ["xclip", "-selection", "clipboard", "-o"],
         capture_output=True,
         env=e,
-        timeout=3,
+        timeout=1,
         check=False,
     ).stdout
+    sniffed = _looks_like_image(text)
+    if sniffed:
+        return sniffed, text
     return "text/plain; charset=utf-8", text
 
 
 def grab() -> tuple[str, bytes]:
+    """Copy the current selection, but do not throw away a PNG ChatGPT already wrote.
+
+    Injecting Ctrl+C when nothing is selected clears Chromium's image clipboard.
+    If Ctrl+C yields nothing useful, keep the image that was already there.
+    """
     e = env()
+    before_mime, before = clip_out()
     subprocess.run(
         ["xdotool", "key", "--clearmodifiers", "ctrl+c"],
         stdout=subprocess.DEVNULL,
@@ -87,8 +127,25 @@ def grab() -> tuple[str, bytes]:
         check=False,
         timeout=5,
     )
-    time.sleep(0.12)
-    return clip_out()
+    last_mime, last = before_mime, before
+    for delay in (0.1, 0.22):
+        time.sleep(delay)
+        mime, data = clip_out()
+        last_mime, last = mime, data
+        # New text (a real selection) must win over a leftover ChatGPT PNG.
+        if data and data != before and not mime.startswith("image/") and data.strip():
+            return mime, data
+        if mime.startswith("image/") and len(data) > 24 and data != before:
+            return mime, data
+    if last_mime.startswith("image/") and len(last) > 24:
+        return last_mime, last
+    if before_mime.startswith("image/") and len(before) > 24:
+        return before_mime, before
+    if last and last.strip():
+        return last_mime, last
+    if before:
+        return before_mime, before
+    return last_mime, last
 
 
 def clip_in(data: bytes, mime: str) -> None:

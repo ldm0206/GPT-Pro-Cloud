@@ -104,7 +104,9 @@ Passwords are stored as per-user salted scrypt hashes. Sign-in is rate limited p
 
 ## Clipboard
 
-The clipboard is two-way between your machine and the desk on the exclusive VNC path. Text and screenshots both work there (gpc-clipd / xclip). That path does not need the debug port.
+The clipboard is two-way between your machine and the desk on the exclusive VNC path. Text, screenshots, and ChatGPT-generated images (the in-page Copy button) all work there (gpc-clipd / xclip, plus a page-clipboard read so a second Ctrl+C does not wipe the PNG). That path does not need the debug port.
+
+Files downloaded inside the desk Chromium stay there (`/config/gpc-downloads`). The gateway does not publish Kasm's web Downloads folder or kclient `/files` to the viewer — a download in ChatGPT must not save onto the occupant's computer.
 
 Tab seats exist only when multi-user / CDP is on for that account. They cannot use the X11 clip relay — it is one clipboard for the whole desktop, not one per tab. They paste text via CDP `Input.insertText` and images (png/jpeg/webp) via a synthetic `ClipboardEvent` on `document.activeElement`. Click the composer first; if nothing is focused the UI says to click the input. They never write the shared X11 clipboard.
 
