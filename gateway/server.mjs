@@ -257,7 +257,14 @@ async function watchDeskDownloads(deskId, user) {
   });
 }
 
-async function findChatGptTargetId(deskId) {
+async function findChatGptTargetId(deskId, seat = null) {
+  if (seat?.targetId) {
+    try {
+      if (await targetExists(deskId, seat.targetId)) return seat.targetId;
+    } catch {
+      /* fall through to the browser-wide scan */
+    }
+  }
   try {
     const pages = await listDeskTargets(deskId);
     const chat =
@@ -351,7 +358,7 @@ async function handleDeskFileUpload(deskId, user, body) {
   const cancel = !!body.cancel;
   let targetId = pending?.targetId || "";
   if (!targetId && !cancel && Array.isArray(body.files) && body.files.length) {
-    targetId = await findChatGptTargetId(deskId);
+    targetId = await findChatGptTargetId(deskId, seats.ofUser(deskId, user.id));
   }
   try {
     const out = await applyDeskUpload({
@@ -600,7 +607,11 @@ async function handleApi(req, res, url, sess) {
   if (url.pathname === "/api/admin/settings" && req.method === "POST") {
     if (sess.user.role !== "admin") return json(res, 403, { error: "没有权限" });
     const body = await readBody(req);
-    return json(res, 200, { settings: users.setSettings(body) });
+    try {
+      return json(res, 200, { settings: users.setSettings(body) });
+    } catch (e) {
+      return json(res, e.status || 400, { error: e.message });
+    }
   }
   if (url.pathname === "/api/desks") {
     const isAdmin = sess.user.role === "admin";
@@ -714,7 +725,7 @@ async function handleApi(req, res, url, sess) {
     if (!users.canOpen(sess.user, deskId)) return json(res, 403, { error: "没有访问权限" });
     const seat = seats.ofUser(deskId, sess.user.id);
     if (seat) seats.beat(seat.id);
-    return json(res, 200, { viewers: presence.beat(deskId, sess.user), seat: publicSeat(seat) });
+    return json(res, 200, { viewers: presence.beat(deskId, sess.user), seat: publicSeat(seat), settings: users.settings() });
   }
   if (url.pathname === "/api/presence/leave" && req.method === "POST") {
     await releaseUserSeats(sess.user.id);

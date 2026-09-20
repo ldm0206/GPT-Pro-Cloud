@@ -212,6 +212,16 @@ describe("standalone product", () => {
     assert.match(ui, /data-proxy-pick/);
     assert.match(ui, /id="proxy-all"/);
     assert.match(ui, /全部应用/);
+    assert.match(gw, /setSettings/);
+    assert.match(ui, /data-fps/);
+    assert.match(ui, /fps-pick/);
+    assert.match(ui, /deskVncFrameRate/);
+    assert.match(ui, /framerate=\$\{fps\}/);
+    assert.match(ui, /framerate_image_mode/);
+    assert.match(ui, /framerate_streaming_mode/);
+    assert.match(ui, /applyVncFrameRate/);
+    assert.match(ui, /updateConnectionSettings/);
+    assert.match(ui, /桌面画质/);
     assert.match(ui, /data-assign/);
     assert.match(ui, /data-resetpw/);
     assert.match(ui, /data-toggle/);
@@ -249,6 +259,8 @@ describe("standalone product", () => {
     assert.doesNotMatch(settingsBlock, /assist-note/);
     assert.doesNotMatch(settingsBlock, /每个账号单独开|class="cdp-rows"/);
     const css = readFileSync(resolve(root, "gateway/web/app.css"), "utf8");
+    assert.match(css, /\.fps-pick/);
+    assert.match(css, /\.fps-row/);
     const panelHead = css.slice(css.indexOf(".panel-head {"), css.indexOf(".panel-head b"));
     assert.match(panelHead, /padding:\s*1[89]px\s+20px\s*;/);
     assert.doesNotMatch(panelHead, /padding:\s*18px\s+20px\s+4px/);
@@ -381,6 +393,9 @@ describe("standalone product", () => {
     assert.match(chooser, /Browser\.downloadProgress/);
     assert.match(chooser, /eventsEnabled: true/);
     assert.match(chooser, /sanitizeDownloadName/);
+    assert.match(chooser, /armChooserEvidence/);
+    assert.match(chooser, /waitForChooserEvidence/);
+    assert.match(chooser, /FILE_NOT_ADDED/);
     assert.match(ui, /id="download-file"/);
     assert.match(ui, /startDownloadPoll/);
     assert.match(ui, /grabDeskDownload/);
@@ -459,6 +474,9 @@ describe("standalone product", () => {
     const userStore = readFileSync(resolve(root, "lib/users.mjs"), "utf8");
     assert.match(userStore, /projectUrls/);
     assert.match(userStore, /projectUrlOn/);
+    assert.match(userStore, /vncFrameRate/);
+    assert.match(userStore, /VNC_FRAME_RATES/);
+    assert.match(userStore, /帧率只能是 15 \/ 24 \/ 30 \/ 60/);
     const deskCdpOnFn = userStore.slice(userStore.indexOf("deskCdpOn("), userStore.indexOf("setDeskCdp"));
     assert.match(deskCdpOnFn, /return false/);
     assert.doesNotMatch(deskCdpOnFn, /data\.deskCdp/);

@@ -11,6 +11,7 @@ import {
   DOWNLOAD_MAX_BYTES,
   FILE_EMPTY,
   FILE_NEED_CHAT,
+  FILE_NOT_ADDED,
   FILE_TOO_BIG,
   FILE_UPLOAD_MAX,
   safeUploadName,
@@ -102,6 +103,9 @@ describe("exclusive VNC local file apply", () => {
         cdp: {
           send: async (method, params) => {
             sent.push({ method, params });
+            if (method === "Runtime.evaluate") {
+              return { result: { value: /names\.length/.test(params.expression || "") ? 1 : true } };
+            }
             return {};
           },
         },
@@ -114,10 +118,46 @@ describe("exclusive VNC local file apply", () => {
       },
     });
     assert.equal(out.ok, true);
-    assert.equal(sent[0].method, "DOM.setFileInputFiles");
-    assert.deepEqual(sent[0].params.files, ["/tmp/gpc-up-1/brief.docx"]);
+    const set = sent.find((c) => c.method === "DOM.setFileInputFiles");
+    assert.deepEqual(set.params.files, ["/tmp/gpc-up-1/brief.docx"]);
+    assert.equal(set.params.backendNodeId, 7);
+    // The evidence probe was armed before the apply and polls saw the change event.
+    const evals = sent.filter((c) => c.method === "Runtime.evaluate").map((c) => c.params.expression);
+    assert.equal(evals.some((e) => /__gpcUp/.test(e) && /addEventListener/.test(e)), true);
+    assert.equal(evals.some((e) => /names\.length/.test(e)), true);
     // ChatGPT reads the bytes lazily — the staged file must survive the apply tick.
     assert.deepEqual(wiped, []);
+  });
+
+  it("reports FILE_NOT_ADDED when no apply lands on a live input", async () => {
+    const wiped = [];
+    const sent = [];
+    const out = await applyDeskUpload({
+      files: [{ name: "a.pdf", mime: "application/pdf", bytes: Buffer.from("%PDF") }],
+      targetId: "t-vnc",
+      pending: { backendNodeId: 9, targetId: "t-vnc" },
+      evidenceWaitMs: 40,
+      attach: async () => ({
+        cdp: {
+          send: async (method, params) => {
+            sent.push({ method, params });
+            if (method === "Runtime.evaluate") {
+              return { result: { value: /names\.length/.test(params.expression || "") ? 0 : true } };
+            }
+            return {};
+          },
+        },
+        sessionId: "s",
+        release: async () => {},
+      }),
+      stage: async () => ({ paths: ["/tmp/gpc-up-9/a.pdf"], wipe: async () => wiped.push(1) }),
+    });
+    assert.equal(out.ok, false);
+    assert.equal(out.error, FILE_NOT_ADDED);
+    // The stale-node path kept failing, so the drop fallback fired too.
+    assert.equal(sent.filter((c) => c.method === "DOM.setFileInputFiles").length >= 1, true);
+    assert.equal(sent.some((c) => c.method === "Input.dispatchDragEvent"), true);
+    assert.deepEqual(wiped, [1]);
   });
 
   it("scheduleUploadWipe deletes the staged dir after the keep window", async () => {
@@ -157,6 +197,9 @@ describe("exclusive VNC local file apply", () => {
         cdp: {
           send: async (method, params) => {
             sent.push({ method, params });
+            if (method === "Runtime.evaluate") {
+              return { result: { value: /names\.length/.test(params.expression || "") ? 1 : true } };
+            }
             return {};
           },
         },
@@ -166,7 +209,7 @@ describe("exclusive VNC local file apply", () => {
       stage: async () => ({ paths: ["/tmp/gpc-up-1/a.pdf"], wipe: async () => {} }),
     });
     assert.equal(pdf.ok, true);
-    assert.equal(sent[0].method, "DOM.setFileInputFiles");
+    assert.equal(sent.some((c) => c.method === "DOM.setFileInputFiles"), true);
     const missing = await applyDeskUpload({
       files: [{ name: "a.pdf", mime: "application/pdf", bytes: Buffer.from("%PDF") }],
     });

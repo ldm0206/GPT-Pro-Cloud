@@ -139,6 +139,12 @@ A proxy is only needed when the server cannot reach ChatGPT directly (for exampl
 
 On **Settings**, **Apply to all** writes the same address to every ChatGPT desk and pushes it live the same way as saving one row (clipd / `--proxy-server`, Chromium restarts). Addresses you have saved stay as chips so you can pick one again without retyping.
 
+## Desktop frame rate
+
+**Settings → 桌面画质** caps the desktop refresh rate for every account (`15 / 24 / 30 / 60`, default 30). The full-desktop stream is the heavy path: the container software-renders 1920×1080 and KasmVNC encodes it at the stock 60 fps cap, which saturates CPU and adds lag through Cloudflare. 30 fps halves the encoding load — latency improves and, counterintuitively, sharpness usually does too (the encoder's dynamic quality has budget to stay high).
+
+The cap applies per connection, client-side: the noVNC URL carries `framerate` and a live desk accepts changes over the beat channel, so no container restart and no desk reload. Resolution is untouched.
+
 ## Concurrent tab seats
 
 One ChatGPT account is still one desktop container and one Chromium profile (`--user-data-dir=/config/chromium`). Two members must not share one VNC mouse — and on a multi-user desk they must not share one desktop picture either. Multi-user tab seats require the admin to turn on **允许多人同时使用** for that account; until then a second person is refused.

@@ -49,6 +49,14 @@ function people(id) {
   return state.presence[id] || [];
 }
 
+/** Stable fingerprint of a presence map — used to skip no-op re-renders. */
+function presenceSignature(presence) {
+  return Object.keys(presence || {})
+    .sort()
+    .map((id) => `${id}:${(presence[id] || []).map((v) => v.id || v.username).sort().join(",")}`)
+    .join("|");
+}
+
 function occupancy(user) {
   if (!user) return [];
   const ids = [];
@@ -435,6 +443,23 @@ function renderSettings() {
     </section>
     <section class="panel">
       <div class="panel-head">
+        <b>桌面画质</b>
+        <em>控制所有账号的桌面画面帧率上限。服务器编码整屏画面很吃 CPU，调低帧率会让画面更跟手、延迟更低，清晰度不受影响（帧率限制的是刷新次数，不是画质）。默认 30。改动即时生效，不用重启桌面。</em>
+      </div>
+      <div class="fps-row">
+        <div class="proxy-id"><b>帧率上限</b></div>
+        <div class="fps-picks">
+          ${[15, 24, 30, 60]
+            .map(
+              (n) =>
+                `<button type="button" class="chip fps-pick ${deskVncFrameRate() === n ? "live" : ""}" data-fps="${n}">${n} fps</button>`,
+            )
+            .join("")}
+        </div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
         <b>出口代理</b>
         <em>服务器能直连 ChatGPT 就留空。不能直连时填一个 http:// 或 socks5:// 地址（<code>127.0.0.1</code> 会自动改写为容器可达）。保存即重启该账号的浏览器；「全部应用」下发到所有账号，留空应用恢复默认出口。</em>
       </div>
@@ -589,12 +614,19 @@ async function copyLastToLocal() {
   return writeToLocal(lastClip.text || "", null);
 }
 
+function deskVncFrameRate() {
+  const n = Number(state.settings?.vncFrameRate);
+  return [15, 24, 30, 60].includes(n) ? n : 30;
+}
+
 function renderDesk() {
   const d = state.desks.find((x) => x.id === state.deskId);
   const vs = people(state.deskId);
   const names = vs.length ? vs.map((v) => v.username).join("、") : "";
   const tab = state.deskMode === "tab";
-  const src = `/vnc/index.html?autoconnect=1&path=websockify&resize=remote&reconnect=true&reconnect_delay=2000&clipboard_up=true&clipboard_down=true&clipboard_seamless=true`;
+  // framerate / framerate_image_mode / framerate_streaming_mode cover old and new noVNC builds.
+  const fps = deskVncFrameRate();
+  const src = `/vnc/index.html?autoconnect=1&path=websockify&resize=remote&reconnect=true&reconnect_delay=2000&clipboard_up=true&clipboard_down=true&clipboard_seamless=true&framerate=${fps}&framerate_image_mode=${fps}&framerate_streaming_mode=${fps}`;
   const surface = !state.seatId
     ? ""
     : tab
@@ -693,6 +725,7 @@ function dropPresence() {
   stopSeatCast();
   stopChooserPoll();
   stopDownloadPoll();
+  stopVncFrameRate();
   if (!state.me) return;
   const uid = state.me.username;
   for (const id of Object.keys(state.presence)) {
@@ -724,6 +757,48 @@ async function adoptDeskText(text, quiet) {
 
 let seatWs = null;
 let seatResize = null;
+let vncFpsTimer = 0;
+
+function stopVncFrameRate() {
+  if (vncFpsTimer) {
+    clearInterval(vncFpsTimer);
+    vncFpsTimer = 0;
+  }
+}
+
+/**
+ * Push the global frame-rate cap into a live noVNC client (same-origin iframe).
+ * The URL params cover fresh loads; this covers a change made while a desk is
+ * already open. rfb.frameRate + updateConnectionSettings() resends encodings —
+ * no reload, no container restart.
+ */
+function applyVncFrameRate() {
+  const iframe = $(".frame iframe");
+  if (!iframe) return false;
+  try {
+    const ui = iframe.contentWindow?.UI;
+    const rfb = ui?.rfb || iframe.contentWindow?.rfb;
+    if (!rfb || typeof rfb !== "object") return false;
+    const fps = deskVncFrameRate();
+    if (Number(rfb.frameRate) === fps) return true;
+    rfb.frameRate = fps;
+    if (typeof rfb.updateConnectionSettings === "function") rfb.updateConnectionSettings();
+    try {
+      ui.forceSetting?.("framerate", fps);
+    } catch {
+      /* older builds — the rfb property above is what reaches the wire */
+    }
+    return true;
+  } catch {
+    /* cross-origin or mid-teardown — the URL params remain the fallback */
+  }
+  return false;
+}
+
+function bindVncFrameRate() {
+  stopVncFrameRate();
+  vncFpsTimer = setInterval(applyVncFrameRate, 5000);
+}
 
 function stopSeatCast() {
   if (seatWs) {
@@ -914,11 +989,13 @@ function bindDesk() {
         } catch {
           /* clipboard is optional; never block the desktop */
         }
+        applyVncFrameRate();
         setTimeout(hide, 400);
       },
       { once: true },
     );
     setTimeout(hide, 8000);
+    bindVncFrameRate();
   } else {
     return;
   }
@@ -1657,6 +1734,22 @@ function bind() {
       await refresh();
     };
   });
+  document.querySelectorAll("[data-fps]").forEach((btn) => {
+    btn.onclick = async () => {
+      const fps = Number(btn.getAttribute("data-fps"));
+      document.querySelectorAll("[data-fps]").forEach((b) => (b.disabled = true));
+      try {
+        const r = await api("/api/admin/settings", { method: "POST", body: { vncFrameRate: fps } });
+        state.settings = r.settings || state.settings;
+        applyVncFrameRate();
+        toast(`帧率已设为 ${fps}，打开的桌面即时生效`);
+        await refresh();
+      } catch (err) {
+        toast(err.message || "没保存成功");
+        document.querySelectorAll("[data-fps]").forEach((b) => (b.disabled = false));
+      }
+    };
+  });
   document.querySelectorAll("[data-proxy-pick]").forEach((btn) => {
     btn.onclick = () => {
       const url = btn.getAttribute("data-proxy-pick") || "";
@@ -1890,6 +1983,11 @@ async function tick() {
     if (state.view === "desk" && state.deskId) {
       const r = await api("/api/presence/beat", { method: "POST", body: { deskId: state.deskId } });
       state.presence[state.deskId] = r.viewers || [];
+      // Pick up a frame-rate change made by the admin while this desk is open.
+      if (r.settings && r.settings.vncFrameRate !== state.settings.vncFrameRate) {
+        state.settings = { ...state.settings, ...r.settings };
+        applyVncFrameRate();
+      }
       const who = $(".who");
       if (who) {
         const names = (r.viewers || []).map((v) => v.username).join("、");
@@ -1898,8 +1996,13 @@ async function tick() {
       }
     } else if (!state.modal && !state.manage && !state.rename && !state.create && !state.assign && !state.resetPw && !state.selfPw) {
       const r = await api("/api/presence");
-      state.presence = r.presence || {};
-      if (state.view === "home" || state.view === "admin") render();
+      const next = r.presence || {};
+      // Re-render only when the occupancy picture actually changed — the 5s
+      // re-render used to restart card hover animations and drop focus.
+      if (presenceSignature(next) !== presenceSignature(state.presence)) {
+        state.presence = next;
+        if (state.view === "home" || state.view === "admin") render();
+      }
     }
   } catch {
     /* ignore */

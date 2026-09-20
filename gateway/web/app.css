@@ -604,6 +604,19 @@ label.switch-row { cursor: pointer; }
 .proxy-input::placeholder { font-family: var(--sans); color: var(--mute); }
 .proxy-row .btn { height: 34px; padding: 0 14px; font-size: 13px; }
 
+/* Frame-rate picks (settings) */
+.fps-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 20px 16px;
+}
+.fps-picks { display: flex; flex-wrap: wrap; gap: 8px; }
+button.chip.fps-pick { cursor: pointer; font-family: var(--mono); }
+button.chip.fps-pick:hover { border-color: var(--ink); color: var(--ink); }
+button.chip.fps-pick.live { color: var(--green); border-color: rgba(23, 143, 95, 0.4); background: rgba(23, 143, 95, 0.07); }
+button.chip.fps-pick:disabled { opacity: 0.5; cursor: default; }
+
 /* Modal */
 .mask {
   position: fixed;

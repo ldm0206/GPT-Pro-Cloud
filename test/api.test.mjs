@@ -216,6 +216,61 @@ describe("presence + kick API", { concurrency: 1 }, () => {
     assert.ok(pdf.status === 409 || pdf.status === 502);
     assert.doesNotMatch(pdf.data.error || "", /开启多人分屏|有人在使用/);
   });
+
+  it("lets the admin tune the global VNC frame rate and shows it to members", async () => {
+    const me = await req(base, "/api/me", { cookie: adminCookie });
+    assert.equal(me.data.settings.vncFrameRate, 30);
+    // ada was kicked in an earlier test — her old cookie is dead, log in again.
+    const relogin = await req(base, "/api/login", { method: "POST", body: { username: "ada", password: "secret6" } });
+    assert.equal(relogin.status, 200);
+    adaCookie = relogin.cookie;
+    const member = await req(base, "/api/me", { cookie: adaCookie });
+    assert.equal(member.data.settings.vncFrameRate, 30);
+
+    const saved = await req(base, "/api/admin/settings", {
+      method: "POST",
+      cookie: adminCookie,
+      body: { vncFrameRate: 15 },
+    });
+    assert.equal(saved.status, 200);
+    assert.equal(saved.data.settings.vncFrameRate, 15);
+    const memberAfter = await req(base, "/api/me", { cookie: adaCookie });
+    assert.equal(memberAfter.data.settings.vncFrameRate, 15);
+    const memberView = await req(base, "/api/settings", { cookie: adaCookie });
+    assert.equal(memberView.data.settings.vncFrameRate, 15);
+
+    // Live desks pick the change up on the presence beat.
+    const beat = await req(base, "/api/presence/beat", {
+      method: "POST",
+      cookie: adaCookie,
+      body: { deskId: "a" },
+    });
+    assert.equal(beat.status, 200);
+    assert.equal(beat.data.settings.vncFrameRate, 15);
+
+    const bad = await req(base, "/api/admin/settings", {
+      method: "POST",
+      cookie: adminCookie,
+      body: { vncFrameRate: 31 },
+    });
+    assert.equal(bad.status, 400);
+    assert.match(bad.data.error || "", /15 \/ 24 \/ 30 \/ 60/);
+
+    const forbidden = await req(base, "/api/admin/settings", {
+      method: "POST",
+      cookie: adaCookie,
+      body: { vncFrameRate: 60 },
+    });
+    assert.equal(forbidden.status, 403);
+
+    const back = await req(base, "/api/admin/settings", {
+      method: "POST",
+      cookie: adminCookie,
+      body: { vncFrameRate: 30 },
+    });
+    assert.equal(back.status, 200);
+    assert.equal(back.data.settings.vncFrameRate, 30);
+  });
 });
 
 describe("CDP lock ignores stored deskCdp=true", { concurrency: 1 }, () => {

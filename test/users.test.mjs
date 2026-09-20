@@ -93,7 +93,7 @@ describe("users + presence", () => {
     assert.equal(store.deskCdpOn("a"), false);
     assert.equal(store.deskCdpOn("b"), false);
     assert.equal(store.assistOn("a"), false);
-    assert.deepEqual(store.settings(), {});
+    assert.deepEqual(store.settings(), { vncFrameRate: 30 });
     assert.throws(() => store.setDeskCdp("a", true), /多人分屏暂未开放/);
     assert.equal(store.deskCdpOn("a"), false);
     assert.equal(store.assistOn("a"), false);
@@ -119,7 +119,25 @@ describe("users + presence", () => {
     assert.equal(s.deskCdpOn("b"), false);
     assert.equal(s.assistOn("a"), false);
     assert.equal(s.assistOn("b"), false);
-    assert.deepEqual(s.settings(), {});
+    assert.deepEqual(s.settings(), { vncFrameRate: 30 });
+  });
+
+  it("stores the global VNC frame rate and reloads it", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gpc-fps-"));
+    const file = join(dir, "users.json");
+    const a = createUserStore({ file, adminUser: "admin", adminPassword: "admin-secret", deskIds: ["a"] });
+    assert.equal(a.settings().vncFrameRate, 30);
+    assert.deepEqual(a.setSettings({ vncFrameRate: 15 }), { vncFrameRate: 15 });
+    assert.equal(a.settings().vncFrameRate, 15);
+    assert.throws(() => a.setSettings({ vncFrameRate: 31 }), /15 \/ 24 \/ 30 \/ 60/);
+    assert.equal(a.settings().vncFrameRate, 15);
+    const b = createUserStore({ file, adminUser: "admin", adminPassword: "admin-secret", deskIds: ["a"] });
+    assert.equal(b.settings().vncFrameRate, 15);
+    assert.deepEqual(b.setSettings({}), { vncFrameRate: 15 });
+    const legacy = join(dir, "legacy.json");
+    writeFileSync(legacy, JSON.stringify({ users: [], settings: { assist: true } }));
+    const c = createUserStore({ file: legacy, adminUser: "admin", adminPassword: "admin-secret", deskIds: ["a"] });
+    assert.equal(c.settings().vncFrameRate, 30);
   });
 
   it("lets admin reset a password, revoke desks and disable login", () => {
