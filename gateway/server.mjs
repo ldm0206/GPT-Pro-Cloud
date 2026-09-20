@@ -18,8 +18,9 @@ import { applyDeskCdpLive, attachSeatTarget, closeTarget, createParkedChatGPTTab
 import { createSeatJailRegistry, navigateSeatToUrl, pickNamedProjectHref, projectUrlFromOnboard, seatStartUrl } from "../lib/project-jail.mjs";
 import { startSeatScreencast } from "../lib/screencast.mjs";
 import { applyTabPastePlan, tabPastePlan } from "../lib/tab-paste.mjs";
-import { applyDeskUpload, armFileChooser, createChooserRegistry, FILE_TOO_BIG, FILE_UPLOAD_FAIL, keepDeskDownloadsInside } from "../lib/file-chooser.mjs";
-import { stageDeskUpload } from "../lib/desk-files.mjs";
+import { applyDeskUpload, armDownloadWatch, armFileChooser, createChooserRegistry, DOWNLOAD_CANCELLED, DOWNLOAD_FAIL, DOWNLOAD_RETENTION_MS, FILE_TOO_BIG, FILE_UPLOAD_FAIL, keepDeskDownloadsInside, sanitizeDownloadName } from "../lib/file-chooser.mjs";
+import { extractTarEntry, resolveDeskDownload, stageDeskUpload } from "../lib/desk-files.mjs";
+import { createNightlySweeper } from "../lib/sweep.mjs";
 import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 8080);
@@ -58,6 +59,8 @@ const loginLimiter = createLoginLimiter({ maxFails: 10, windowMs: 15 * 60 * 1000
 const deskCdpLocks = new Map();
 const choosers = createChooserRegistry();
 const fileWatches = new Map();
+/** grabbed desk downloads awaiting the occupant's save dialog: userId → Map<id, rec> */
+const grabs = new Map();
 const FILE_BODY_MAX = 16 * 1024 * 1024;
 /** Yield so a second /open can create a tab before assist grabs the debugger. */
 const ONBOARD_YIELD_MS = 1500;
@@ -195,6 +198,65 @@ function stopFileWatch(userId) {
   }
 }
 
+function putGrab(userId, rec) {
+  let mine = grabs.get(userId);
+  if (!mine) {
+    mine = new Map();
+    grabs.set(userId, mine);
+  }
+  const stamp = `${rec.savedAt}-${Math.random().toString(36).slice(2, 6)}`;
+  mine.set(stamp, rec);
+  for (const [key, r] of mine) {
+    if (r.claimed || rec.savedAt - r.savedAt > DOWNLOAD_RETENTION_MS) mine.delete(key);
+  }
+  return stamp;
+}
+
+function newestGrab(userId) {
+  const mine = grabs.get(userId);
+  if (!mine?.size) return null;
+  let best = null;
+  for (const [id, rec] of mine) {
+    if (rec.claimed) continue;
+    if (!best || rec.savedAt > best.rec.savedAt) best = { id, rec };
+  }
+  return best;
+}
+
+function forgetUserGrabs(userId) {
+  const mine = grabs.get(userId);
+  if (mine) {
+    for (const rec of mine.values()) {
+      const purge = rec.cleanup?.();
+      Promise.resolve(purge).catch(() => {});
+    }
+    grabs.delete(userId);
+  }
+}
+
+async function watchDeskDownloads(deskId, user) {
+  const attached = await attachSeatTarget(deskId);
+  const armed = await armDownloadWatch({
+    send: (method, params, sid) => attached.cdp.send(method, params, sid ?? attached.sessionId),
+    on: (fn) => attached.cdp.on(fn),
+    onDownload: (info) => {
+      if (!info.size) return;
+      putGrab(user.id, { deskId, name: info.name, size: info.size, savedAt: info.savedAt });
+    },
+  });
+  fileWatches.set(user.id, {
+    deskId,
+    dispose() {
+      try {
+        armed.dispose?.();
+      } catch {
+        /* ignore */
+      }
+      Promise.resolve(attached.release?.()).catch(() => {});
+    },
+  });
+}
+
 async function findChatGptTargetId(deskId) {
   try {
     const pages = await listDeskTargets(deskId);
@@ -308,8 +370,68 @@ async function handleDeskFileUpload(deskId, user, body) {
   }
 }
 
+async function handleDeskFileDownload(deskId, user, body) {
+  const wantName = String(body?.name || "");
+  const want = wantName ? sanitizeDownloadName(wantName) : "";
+  const wantId = String(body?.id || "");
+  const settleMs = Math.max(0, Math.min(60_000, Number(body?.waitMs) || 0));
+  const deadline = Date.now() + settleMs;
+  let pending = null;
+  while (Date.now() < deadline) {
+    const newest = newestGrab(user.id);
+    if (!newest) break;
+    if (wantId && newest.id !== wantId) break;
+    if (!want || newest.rec.name === want) {
+      pending = newest;
+      break;
+    }
+    const age = Date.now() - newest.rec.savedAt;
+    if (!wantId) {
+      if (age > 3000) break;
+      await sleep(300);
+      continue;
+    }
+    if (age < 6000) {
+      await sleep(300);
+      continue;
+    }
+    break;
+  }
+  if (!pending) return { ok: false, status: 404, error: DOWNLOAD_FAIL };
+
+  try {
+    const container = deskContainerName(deskId);
+    const found = await resolveDeskDownload(pending.rec.name, {
+      readdir: (dir) => docker.request("GET", `/containers/${encodeURIComponent(container)}/archive?path=${encodeURIComponent(dir)}`).then((list) => (Array.isArray(list) ? list.map((e) => String(e?.name || "")).filter((n) => n && n !== "." && n !== ".." && !n.includes("/")) : [])),
+      stat: async (p) => {
+        const tar = await docker.getArchive(container, p);
+        return { size: extractTarEntry(tar, p.split("/").pop())?.length || 0 };
+      },
+    });
+    if (!found || found.size < pending.rec.size - 2) return { ok: false, status: 502, error: DOWNLOAD_FAIL };
+
+    const tar = await docker.getArchive(container, `/config/gpc-downloads/${found.name}`);
+    const bytes = extractTarEntry(tar, found.name);
+    if (!bytes || !bytes.length) return { ok: false, status: 502, error: DOWNLOAD_FAIL };
+
+    pending.rec.claimed = true;
+    pending.rec.finalName = found.name;
+    pending.rec.cleanup = async () => {
+      try {
+        await docker.rmfile(container, `/config/gpc-downloads/${found.name}`);
+      } catch {
+        /* orphan copy stays in the desk */
+      }
+    };
+    return { ok: true, name: found.name, size: bytes.length, bytes };
+  } catch {
+    return { ok: false, status: 502, error: DOWNLOAD_FAIL };
+  }
+}
+
 async function releaseUserSeats(userId) {
   stopFileWatch(userId);
+  forgetUserGrabs(userId);
   const released = seats.releaseByUser(userId);
   await Promise.all(released.map((s) => closeSeatTab(s)));
   return released;
@@ -656,6 +778,7 @@ async function handleApi(req, res, url, sess) {
     if (seat?.mode === "vnc") {
       try {
         await watchExclusiveFileChooser(id, sess.user);
+        await watchDeskDownloads(id, sess.user);
       } catch {
         /* file pipe is best-effort — exclusive VNC still opens */
       }
@@ -717,6 +840,52 @@ async function handleApi(req, res, url, sess) {
     const out = await handleDeskFileUpload(id, sess.user, body);
     if (!out.ok) return json(res, out.status || 502, { error: out.error || FILE_UPLOAD_FAIL });
     return json(res, 200, { ok: true, kind: out.kind || (out.cancelled ? "cancel" : "file") });
+  }
+  const grabsApi = url.pathname.match(/^\/api\/desks\/([a-z0-9-]+)\/downloads$/);
+  if (grabsApi && req.method === "GET") {
+    const id = grabsApi[1];
+    if (!users.canOpen(sess.user, id) || !registry.has(id)) return json(res, 403, { error: "没有访问权限" });
+    const mine = grabs.get(sess.user.id);
+    if (!mine?.size) return json(res, 200, { open: false });
+    const newest = newestGrab(sess.user.id);
+    if (newest?.rec.deskId !== id) return json(res, 200, { open: false });
+    return json(res, 200, { open: true, id: newest.id, name: newest.rec.name, size: newest.rec.size });
+  }
+  const pull = url.pathname.match(/^\/api\/desks\/([a-z0-9-]+)\/downloads\/pull$/);
+  if (pull && req.method === "POST") {
+    const id = pull[1];
+    if (!users.canOpen(sess.user, id) || !registry.has(id)) return json(res, 403, { error: "没有访问权限" });
+    let body;
+    try {
+      body = await readFileUploadBody(req);
+    } catch (e) {
+      return json(res, e.status || 400, { error: e.message || DOWNLOAD_FAIL });
+    }
+    const out = await handleDeskFileDownload(id, sess.user, body);
+    if (!out.ok) return json(res, out.status || 502, { error: out.error || DOWNLOAD_FAIL });
+    const filename = out.name.replace(/[^\w.一-鿿-]+/g, "_");
+    res.writeHead(200, {
+      "content-type": "application/octet-stream",
+      "content-length": String(out.bytes.length),
+      "content-disposition": `attachment; filename="${filename}"; filename*=UTF-8''${encodeURIComponent(out.name)}`,
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "same-origin",
+    });
+    res.end(out.bytes);
+    return;
+  }
+  const grabDone = url.pathname.match(/^\/api\/desks\/([a-z0-9-]+)\/downloads\/([a-z0-9-]+)$/);
+  if (grabDone && req.method === "DELETE") {
+    const id = grabDone[1];
+    if (!users.canOpen(sess.user, id) || !registry.has(id)) return json(res, 403, { error: "没有访问权限" });
+    const mine = grabs.get(sess.user.id);
+    const rec = mine?.get(grabDone[2]);
+    if (rec) {
+      mine.delete(grabDone[2]);
+      Promise.resolve(rec.cleanup?.()).catch(() => {});
+    }
+    return json(res, 200, { ok: true, cancelled: !!rec });
   }
   const chooserApi = url.pathname.match(/^\/api\/desks\/([a-z0-9-]+)\/file-chooser$/);
   if (chooserApi && req.method === "GET") {
@@ -1053,7 +1222,13 @@ setInterval(() => {
   }
 }, 15_000);
 
+const sweeper = createNightlySweeper({
+  desktopIds: () => registry.all().map((d) => d.id),
+  exec: (id, cmd, timeoutMs) => docker.execCapture(deskContainerName(id), cmd, { timeoutMs }),
+});
+
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`gateway on :${PORT} desks=${registry.ids().join(",")} tabSeats=${seats.cap}`);
   reconcileExtraDesks();
+  sweeper.start();
 });

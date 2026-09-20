@@ -3,17 +3,21 @@ import assert from "node:assert/strict";
 import {
   applyDeskUpload,
   applyFilesToChooser,
+  armDownloadWatch,
   armFileChooser,
   cancelFileChooser,
   classifyDeskFiles,
   createChooserRegistry,
+  DOWNLOAD_MAX_BYTES,
   FILE_EMPTY,
   FILE_NEED_CHAT,
   FILE_TOO_BIG,
   FILE_UPLOAD_MAX,
   safeUploadName,
+  sanitizeDownloadName,
+  scheduleUploadWipe,
 } from "../lib/file-chooser.mjs";
-import { deskUploadDir, packUstar } from "../lib/desk-files.mjs";
+import { deskUploadDir, extractTarEntry, packUstar, resolveDeskDownload } from "../lib/desk-files.mjs";
 
 describe("exclusive VNC local file apply", () => {
   it("rejects oversized and empty uploads with a Chinese error", () => {
@@ -112,6 +116,34 @@ describe("exclusive VNC local file apply", () => {
     assert.equal(out.ok, true);
     assert.equal(sent[0].method, "DOM.setFileInputFiles");
     assert.deepEqual(sent[0].params.files, ["/tmp/gpc-up-1/brief.docx"]);
+    // ChatGPT reads the bytes lazily — the staged file must survive the apply tick.
+    assert.deepEqual(wiped, []);
+  });
+
+  it("scheduleUploadWipe deletes the staged dir after the keep window", async () => {
+    const wiped = [];
+    const cancel = scheduleUploadWipe(async () => wiped.push(1), 40);
+    assert.deepEqual(wiped, []);
+    await new Promise((r) => setTimeout(r, 80));
+    assert.deepEqual(wiped, [1]);
+    cancel();
+  });
+
+  it("deletes the staged file with the page when the apply fails", async () => {
+    const wiped = [];
+    await assert.rejects(
+      () =>
+        applyDeskUpload({
+          files: [{ name: "a.pdf", mime: "application/pdf", bytes: Buffer.from("%PDF") }],
+          targetId: "t-vnc",
+          pending: { backendNodeId: 3, targetId: "t-vnc" },
+          attach: async () => {
+            throw new Error("无法连接页面");
+          },
+          stage: async () => ({ paths: ["/tmp/gpc-up-2/a.pdf"], wipe: async () => wiped.push(1) }),
+        }),
+      /无法连接页面/,
+    );
     assert.deepEqual(wiped, [1]);
   });
 
@@ -161,5 +193,91 @@ describe("exclusive VNC local file apply", () => {
     assert.equal(tar.toString("utf8", 0, 20).startsWith("gpc-up-aa"), true);
     const fileHdr = tar.subarray(512, 1024).toString("utf8");
     assert.match(fileHdr, /gpc-up-aa\/note\.txt/);
+  });
+
+  it("sanitizes download filenames for the save dialog", () => {
+    assert.equal(sanitizeDownloadName("../../etc/passwd"), "passwd");
+    assert.equal(sanitizeDownloadName(""), "download");
+    assert.equal(sanitizeDownloadName("C:\\Users\\a\\报告 v2.pdf"), "报告 v2.pdf");
+    assert.match(sanitizeDownloadName("evil\u0000name.txt"), /evilname\.txt/);
+  });
+
+  it("extracts only the named root entry from a docker archive tar", () => {
+    const tar = packUstar([
+      { name: "report.pdf", bytes: Buffer.from("%PDF-1.4 hello") },
+      { name: "nested/trick.txt", bytes: Buffer.from("nope") },
+    ]);
+    assert.equal(extractTarEntry(tar, "report.pdf").toString("utf8"), "%PDF-1.4 hello");
+    assert.equal(extractTarEntry(tar, "trick.txt"), null);
+    assert.equal(extractTarEntry(tar, "missing.pdf"), null);
+    assert.equal(extractTarEntry(Buffer.alloc(1024), "x"), null);
+  });
+
+  it("waits for the desk download to settle before reading it", async () => {
+    const sizes = new Map();
+    const polls = [];
+    const out = await resolveDeskDownload("report.pdf", {
+      readdir: async () => [...sizes.keys()],
+      stat: async (p) => {
+        const n = p.split("/").pop();
+        if (!sizes.has(n)) throw new Error("ENOENT");
+        return { size: sizes.get(n) };
+      },
+      sleep: async () => {
+        polls.push(1);
+        if (polls.length === 1) sizes.set("report.pdf", 10);
+        if (polls.length === 2) sizes.set("report.pdf", 2048);
+      },
+    });
+    assert.deepEqual(out, { name: "report.pdf", size: 2048 });
+    const miss = await resolveDeskDownload("report.pdf", {
+      readdir: async () => [],
+      stat: async () => {
+        throw new Error("ENOENT");
+      },
+      sleep: async () => {},
+      timeoutMs: 1,
+    });
+    assert.equal(miss, null);
+  });
+
+  it("arms download events and surfaces finished pulls", async () => {
+    const calls = [];
+    const listeners = [];
+    const finished = [];
+    await armDownloadWatch({
+      send: async (method, params) => calls.push({ method, params }),
+      on: (fn) => {
+        listeners.push(fn);
+        return () => {};
+      },
+      onDownload: (info) => finished.push(info),
+    });
+    assert.equal(
+      calls.some(
+        (c) =>
+          c.method === "Browser.setDownloadBehavior" &&
+          c.params.eventsEnabled === true &&
+          c.params.behavior === "default" &&
+          /gpc-downloads/.test(c.params.downloadPath || ""),
+      ),
+      true,
+    );
+    listeners[0]({ method: "Browser.downloadWillBegin", params: { guid: "g1", suggestedFilename: "报告 v2.pdf" } });
+    listeners[0]({ method: "Browser.downloadProgress", params: { guid: "g1", state: "inProgress", receivedBytes: 5, totalBytes: 90 } });
+    assert.equal(finished.length, 0);
+    listeners[0]({ method: "Browser.downloadProgress", params: { guid: "g1", state: "completed", totalBytes: 90 } });
+    assert.equal(finished.length, 1);
+    assert.equal(finished[0].name, "报告 v2.pdf");
+    assert.equal(finished[0].size, 90);
+    listeners[0]({ method: "Browser.downloadProgress", params: { guid: "g1", state: "completed", totalBytes: 90 } });
+    assert.equal(finished.length, 1);
+    const before = finished.length;
+    listeners[0]({ method: "Browser.downloadWillBegin", params: { guid: "g2", suggestedFilename: "big.bin" } });
+    listeners[0]({
+      method: "Browser.downloadProgress",
+      params: { guid: "g2", state: "completed", totalBytes: DOWNLOAD_MAX_BYTES + 1 },
+    });
+    assert.equal(finished.length, before);
   });
 });

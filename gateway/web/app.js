@@ -95,6 +95,7 @@ const ICO = {
   userx: `<svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M10 11a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM3.5 20c.7-3.6 3.4-5.5 6.5-5.5 1.1 0 2.1.2 3 .7M16 15l5 5M21 15l-5 5"/></svg>`,
   clip: `<svg class="ico-clip" viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M9 4h6v3H9zM15 5h3a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h3"/></svg>`,
   upload: `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M12 16V5M8 8.5 12 4.5 16 8.5M6 19h12"/></svg>`,
+  download: `<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M12 5v11M8 12.5 12 16.5 16 12.5M6 19h12"/></svg>`,
 };
 
 function greet() {
@@ -452,6 +453,26 @@ const isMac = /Mac|iPhone|iPad/.test(String(navigator.userAgent || navigator.pla
 const MOD = isMac ? "Cmd" : "Ctrl";
 let lastClip = null;
 let lastThumb = "";
+let lastGrab = null;
+
+function clipName(name) {
+  const s = String(name || "");
+  return s.length > 14 ? `${s.slice(0, 12)}…` : s || "文件";
+}
+
+function setDownload(info) {
+  lastGrab = info ? { ...info, saved: false } : null;
+  const btn = $("#download-file");
+  const label = $("#download-label");
+  if (!btn) return;
+  if (!lastGrab) {
+    btn.hidden = true;
+    if (label) label.textContent = "保存";
+    return;
+  }
+  btn.hidden = false;
+  if (label) label.textContent = `保存 ${clipName(lastGrab.name)}`;
+}
 
 function clipKeys() {
   return `<span class="clip-sep"></span><span class="clip-keys"><kbd>${MOD}+C</kbd><kbd>${MOD}+V</kbd></span>`;
@@ -589,6 +610,7 @@ function renderDesk() {
       </div>
       <div class="chrome-end">
         ${deskCdpOn(state.deskId) ? `<button type="button" class="chrome-btn" id="share-chat">${ICO.share}<span>分享</span></button>` : ""}
+        ${tab ? "" : `<button type="button" class="chrome-btn" id="download-file" hidden>${ICO.download}<span id="download-label">保存</span></button>`}
         <button type="button" class="chrome-btn" id="upload-files">${ICO.upload}<span>上传</span></button>
         <button type="button" class="clip-chip" id="clip-chip"></button>
       </div>
@@ -670,6 +692,7 @@ function dropPresence() {
   stopPeek();
   stopSeatCast();
   stopChooserPoll();
+  stopDownloadPoll();
   if (!state.me) return;
   const uid = state.me.username;
   for (const id of Object.keys(state.presence)) {
@@ -919,9 +942,20 @@ function bindDesk() {
       const r = await sendOsFiles(list);
       toast(r.ok ? "已添加到对话" : r.error || "无法上传文件");
     };
+  const downloadBtn = $("#download-file");
+  if (downloadBtn)
+    downloadBtn.onclick = async () => {
+      if (!lastGrab) return;
+      const grabbed = lastGrab;
+      setDownload({ ...grabbed, saved: true });
+      const ok = await grabDeskDownload(grabbed);
+      if (!ok) setDownload(grabbed);
+    };
   bindDeskFileDrop();
   if (state.deskMode === "vnc") startChooserPoll();
   else stopChooserPoll();
+  if (state.deskMode === "vnc") startDownloadPoll();
+  else stopDownloadPoll();
   const shareBtn = $("#share-chat");
   if (shareBtn)
     shareBtn.onclick = async () => {
@@ -1063,6 +1097,75 @@ async function onRemoteFileChooser(mode) {
   }
   const r = await sendOsFiles(list);
   toast(r.ok ? "已添加到对话" : r.error || "无法上传文件");
+}
+
+/** Reverse of the upload pipe: grab a finished desk download and open the
+ *  browser's own save dialog. The dialog IS the local save — no auto-dump. */
+async function grabDeskDownload(info) {
+  const r = await fetch(`/api/desks/${state.deskId}/downloads/pull`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ id: info.id, name: info.name, waitMs: 8000 }),
+  });
+  if (!r.ok) {
+    toast("没拿到下载文件，请再点一次");
+    return false;
+  }
+  const buf = await r.arrayBuffer();
+  const blob = new Blob([buf], { type: r.headers.get("content-type") || "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = info.name || "download";
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  fetch(`/api/desks/${state.deskId}/downloads/${encodeURIComponent(info.id)}`, {
+    method: "DELETE",
+    credentials: "same-origin",
+  }).catch(() => {});
+  toast(`已保存「${info.name}」`);
+  if (lastGrab?.id === info.id) setDownload(null);
+  return true;
+}
+
+let downloadPoll = 0;
+
+function stopDownloadPoll() {
+  downloadPoll += 1;
+}
+
+/** Desk download finished → open the local save dialog. User gestures never
+ *  reach us here, so a blocked dialog falls back to the 顶栏 save button. */
+async function startDownloadPoll() {
+  const ticket = ++downloadPoll;
+  const id = state.deskId;
+  let seen = "";
+  while (ticket === downloadPoll && state.view === "desk" && state.deskId === id && state.deskMode === "vnc") {
+    try {
+      const r = await fetch(`/api/desks/${id}/downloads`, { credentials: "same-origin" });
+      if (ticket !== downloadPoll) return;
+      if (!r.ok) {
+        await new Promise((ok) => setTimeout(ok, 1500));
+        continue;
+      }
+      const data = await r.json().catch(() => ({}));
+      if (data.open && data.id && data.id !== seen) {
+        seen = data.id;
+        setDownload(data);
+        const ok = await grabDeskDownload(data);
+        if (!ok) toast("下载已就绪，点顶栏「保存」拿文件");
+      } else if (!data.open && lastGrab && !lastGrab.saved) {
+        lastGrab = null;
+        setDownload(null);
+      }
+    } catch {
+      await new Promise((ok) => setTimeout(ok, 1500));
+    }
+  }
 }
 
 let chooserPoll = 0;
