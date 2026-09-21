@@ -529,6 +529,9 @@ async function readBody(req) {
   }
 }
 
+/** Turnstile 的 widget 走 iframe；开着的时候往这一条里追加 challenge 域。 */
+const FRAME_SRC = "frame-src 'self'";
+
 const PANEL_CSP = [
   "default-src 'self'",
   "script-src 'self'",
@@ -536,18 +539,24 @@ const PANEL_CSP = [
   "font-src https://fonts.gstatic.com",
   "img-src 'self' data: blob:",
   "connect-src 'self'",
-  "frame-src 'self'",
+  FRAME_SRC,
   "frame-ancestors 'self'",
   "base-uri 'self'",
   "form-action 'self'",
 ].join("; ");
 
-/** 只有真的开着 Turnstile 时才把 Cloudflare 加进 CSP，默认部署仍是全 'self'。 */
+/** 只有真的开着 Turnstile 时才把 Cloudflare 加进 CSP，默认部署仍是全 'self'。
+ *
+ * frame-src 必须追加而不是替换 —— 工作台把同源的远程桌面（kasmvnc 的
+ * /vnc/index.html）塞在 iframe 里，一旦这一条只剩 challenges.cloudflare.com，
+ * 浏览器就把桌面毙掉："Framing ... violates ... frame-src https://challenges.cloudflare.com"。
+ */
 function panelCsp(turnstileOn) {
   if (!turnstileOn) return PANEL_CSP;
-  return PANEL_CSP.replace("script-src 'self'", "script-src 'self' https://challenges.cloudflare.com")
+  return PANEL_CSP
+    .replace("script-src 'self'", "script-src 'self' https://challenges.cloudflare.com")
     .replace("connect-src 'self'", "connect-src 'self' https://challenges.cloudflare.com")
-    .replace("frame-src 'self'", "frame-src https://challenges.cloudflare.com");
+    .replace(FRAME_SRC, `${FRAME_SRC} https://challenges.cloudflare.com`);
 }
 
 /** 当前生效的一对密钥：设置里存的优先，否则用 .env。每请求取，管理员改完立即生效。 */

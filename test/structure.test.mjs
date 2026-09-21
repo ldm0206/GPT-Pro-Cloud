@@ -544,11 +544,13 @@ describe("standalone product", () => {
     assert.match(gw, /turnstileSiteKey/);
     assert.match(gw, /users\.turnstileKeys\(\)/);
     // 只有开启时才把 Cloudflare 加进 CSP，默认部署仍是全 'self'
-    const cspBlock = gw.slice(gw.indexOf("const PANEL_CSP"), gw.indexOf("function turnstileNow"));
+    const cspBlock = gw.slice(gw.indexOf("const FRAME_SRC"), gw.indexOf("function turnstileNow"));
     assert.match(cspBlock, /function panelCsp\(turnstileOn\)/);
     assert.match(cspBlock, /"script-src 'self'"/);
-    assert.match(cspBlock, /"frame-src 'self'"/);
+    assert.match(cspBlock, /const FRAME_SRC = "frame-src 'self'"/);
     assert.match(cspBlock, /https:\/\/challenges\.cloudflare\.com/);
+    // 工作台同源 iframe 开远程桌面 —— frame-src 必须追加 Cloudflare，不能用替换把 'self' 挤掉
+    assert.match(cspBlock, /\.replace\(FRAME_SRC, `\$\{FRAME_SRC\} https:\/\/challenges\.cloudflare\.com`\)/);
     // 静态文件按当前开关取 CSP，管理员改完密钥不用重启网关
     assert.match(gw, /panelCsp\(turnstileNow\(\)\.enabled\)/);
     const loginBlock = gw.slice(gw.indexOf('url.pathname === "/api/login"'), gw.indexOf('url.pathname === "/api/logout"'));

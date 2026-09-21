@@ -417,7 +417,7 @@ describe("login behind Cloudflare Turnstile", { concurrency: 1 }, () => {
     const page = await fetch(`${base}/`);
     const csp = page.headers.get("content-security-policy") || "";
     assert.match(csp, /script-src 'self' https:\/\/challenges\.cloudflare\.com/);
-    assert.match(csp, /frame-src https:\/\/challenges\.cloudflare\.com/);
+    assert.match(csp, /frame-src 'self' https:\/\/challenges\.cloudflare\.com/);
     assert.doesNotMatch(await page.text(), /secret-key-456/);
   });
 
@@ -577,6 +577,8 @@ describe("turnstile configured only in the admin panel", { concurrency: 1 }, () 
     assert.equal(setupAfter.data.turnstileSiteKey, "panel-site");
     const cspAfter = (await fetch(`${base}/`)).headers.get("content-security-policy") || "";
     assert.match(cspAfter, /script-src 'self' https:\/\/challenges\.cloudflare\.com/);
+    // 开 Turnstile 也不能把工作台同源 iframe 的远程桌面挤出去：frame-src 只能追加
+    assert.match(cspAfter, /frame-src 'self' https:\/\/challenges\.cloudflare\.com/);
 
     // 清空后关掉，登录回到只验密码
     const off = await req(base, "/api/admin/settings", {
@@ -590,5 +592,48 @@ describe("turnstile configured only in the admin panel", { concurrency: 1 }, () 
     assert.equal(back.status, 200);
     const stored = JSON.parse(readFileSync(usersFile, "utf8"));
     assert.deepEqual(stored.settings.turnstile, { siteKey: "", secret: "" });
+  });
+});
+
+describe("desk CSP: same-origin VNC stays frameable", { concurrency: 1 }, () => {
+  // 工作台把同源的远程桌面（/vnc/index.html）塞进 iframe。
+  // 回归点：panelCsp 开着 Turnstile 时把 "frame-src 'self'" 整个替换掉，
+  // 浏览器就报 "Framing 'https://.../vnc/index.html?...' violates ...
+  // frame-src https://challenges.cloudflare.com"。frame-src 只能追加。
+  let child;
+  let base;
+
+  before(async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gpc-desk-csp-"));
+    const port = 18000 + Math.floor(Math.random() * 2000);
+    child = spawn(process.execPath, [join(root, "gateway/server.mjs")], {
+      cwd: root,
+      env: {
+        ...process.env,
+        PORT: String(port),
+        AUTH_USER: "admin",
+        AUTH_PASSWORD: "admin-secret",
+        USERS_FILE: join(dir, "users.json"),
+        INSTANCES: "a,b",
+        DOCKER_SOCKET: join(dir, "no-docker.sock"),
+        TURNSTILE_SITE_KEY: "site-key-123",
+        TURNSTILE_SECRET_KEY: "secret-key-456",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    await waitForLog(child, /gateway on/);
+    base = `http://127.0.0.1:${port}`;
+  });
+
+  after(() => {
+    if (child && !child.killed) child.kill("SIGTERM");
+  });
+
+  it("keeps 'self' in frame-src even with Turnstile on", async () => {
+    // 登录前 "/" 也发 CSP（先取页面再登），这条不依赖会话
+    const res = await fetch(`${base}/`);
+    assert.equal(res.status, 200);
+    const csp = res.headers.get("content-security-policy") || "";
+    assert.match(csp, /frame-src 'self' https:\/\/challenges\.cloudflare\.com/);
   });
 });
