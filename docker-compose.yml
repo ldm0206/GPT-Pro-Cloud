@@ -37,6 +37,9 @@ services:
       - PORT=8080
       - AUTH_PASSWORD=${AUTH_PASSWORD:-}
       - AUTH_USER=${AUTH_USER:-admin}
+      # 登录人机验证；两个都填才开启，留空则登录页不加验证
+      - TURNSTILE_SITE_KEY=${TURNSTILE_SITE_KEY:-}
+      - TURNSTILE_SECRET_KEY=${TURNSTILE_SECRET_KEY:-}
       - USERS_FILE=/data/users.json
       - INSTANCES=${INSTANCES:-a,b}
       - TAB_SEATS_MAX=${TAB_SEATS_MAX:-3}

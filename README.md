@@ -75,6 +75,12 @@ Share the `https://` URL it prints. You sign in with the administrator you alrea
 
 For a stable hostname, point a named tunnel at the same local port (that needs a domain on Cloudflare).
 
+## Login captcha
+
+Once the sign-in page is on the open internet, put a Cloudflare Turnstile widget in front of it. Create a site in the Cloudflare dashboard (Turnstile → Add site, widget type **Managed**) and paste the pair either into `.env` (`TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY`) or into **Settings → 登录人机验证**. Both keys are required; the site key is the only one that reaches the browser, and the secret stays in the gateway and is checked against `challenges.cloudflare.com` on every attempt.
+
+The widget sits between the form and the password check, so a script cannot spend a password guess without a token — the per-`ip|username` rate limit still runs behind it. Tokens are single-use, so a refused sign-in re-draws the widget. If the verifier cannot be reached the attempt is refused rather than waved through. Settings override `.env`, take effect without a restart, and clearing the site key hands the pair back to `.env` — so a pair that came from `.env` can only be switched off there. While it is on, the panel CSP allows `challenges.cloudflare.com` for scripts, frames and connections; otherwise the panel stays entirely `'self'`.
+
 ## Add an account
 
 One ChatGPT account is one desktop container. The administrator adds one from the home page: **Add ChatGPT account**, give it a name, and a new card appears. Open it and log in to ChatGPT once — same as `a` / `b`.
@@ -100,7 +106,7 @@ Members are managed on the **Team** page, which only the administrator sees.
 | Disconnect a live seat | On a live account card, **断开** revokes that member's login and drops **their** VNC or tab seat; other members on the same account keep their tab. The container stays up. They sign in again. The member stays |
 | Delete an extra account | On a panel-created card, **删除** stops the container and wipes `./data/<id>` so a re-add is clean. Built-in `a` / `b` stay |
 
-Passwords are stored as per-user salted scrypt hashes. Sign-in is rate limited per `ip|username` (10 attempts per 15 minutes), and sessions survive a restart.
+Passwords are stored as per-user salted scrypt hashes. Sign-in is rate limited per `ip|username` (10 attempts per 15 minutes), and sessions survive a restart. A public deployment can add a Turnstile widget in front of sign-in — see [Login captcha](#login-captcha).
 
 ## Clipboard
 
@@ -134,6 +140,7 @@ Everything lives in `.env` — the commented [`.env.example`](.env.example) is t
 | `BIND_ADDR` | Address the gateway publishes on; `127.0.0.1` when tunneling, LAN or VPN address on a private network |
 | `PROXY_URL_A`, `PROXY_URL_B` | Default per-account proxy; Settings (per desk or Apply to all) take precedence and apply immediately |
 | `PROXY_URL` | Default proxy shared by every account |
+| `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` | Optional: Cloudflare Turnstile pair for the sign-in page. Both are needed, and **Settings → 登录人机验证** overrides them — see [Login captcha](#login-captcha) |
 
 A proxy is only needed when the server cannot reach ChatGPT directly (for example, hosts in mainland China); leave it empty otherwise. The prerequisite is an `http://` / `https://` / `socks5://` endpoint reachable from the server — for a proxy client running on the host, a loopback address like `http://127.0.0.1:7890` works and is rewritten to a container-reachable one automatically.
 

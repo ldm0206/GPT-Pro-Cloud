@@ -4,6 +4,7 @@ import { extname, join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import httpProxy from "http-proxy";
 import { createSessionToken, readSession, createLoginLimiter, createSessionStore } from "../lib/auth.mjs";
+import { turnstileConfig, verifyTurnstile } from "../lib/turnstile.mjs";
 import { parseInstances } from "../lib/instances.mjs";
 import { createDeskRegistry, provisionDesk, retireDesk } from "../lib/desks.mjs";
 import { createDockerClient, deskContainerName, ensureDeskContainer, removeDeskContainer } from "../lib/docker.mjs";
@@ -26,6 +27,10 @@ import { WebSocketServer } from "ws";
 const PORT = Number(process.env.PORT || 8080);
 const AUTH_USER = process.env.AUTH_USER || "admin";
 const AUTH_PASSWORD = String(process.env.AUTH_PASSWORD || "").trim(); // 可选：留空走首次访问向导
+// .env 是默认值；管理员在「设置」里存的那一对优先
+const TURNSTILE_ENV = turnstileConfig();
+if (TURNSTILE_ENV.enabled) console.log(`turnstile on from env (site key ${TURNSTILE_ENV.siteKey})`);
+else if (TURNSTILE_ENV.siteKey || TURNSTILE_ENV.secret) console.warn("TURNSTILE_SITE_KEY / TURNSTILE_SECRET_KEY 只填了一个 —— 这半边不生效，请在「设置」里补齐");
 const SEED = parseInstances(process.env.INSTANCES || "a,b");
 const registry = createDeskRegistry(SEED);
 const docker = createDockerClient({
@@ -537,6 +542,35 @@ const PANEL_CSP = [
   "form-action 'self'",
 ].join("; ");
 
+/** 只有真的开着 Turnstile 时才把 Cloudflare 加进 CSP，默认部署仍是全 'self'。 */
+function panelCsp(turnstileOn) {
+  if (!turnstileOn) return PANEL_CSP;
+  return PANEL_CSP.replace("script-src 'self'", "script-src 'self' https://challenges.cloudflare.com")
+    .replace("connect-src 'self'", "connect-src 'self' https://challenges.cloudflare.com")
+    .replace("frame-src 'self'", "frame-src https://challenges.cloudflare.com");
+}
+
+/** 当前生效的一对密钥：设置里存的优先，否则用 .env。每请求取，管理员改完立即生效。 */
+function turnstileNow() {
+  const stored = users.turnstileKeys();
+  const siteKey = stored.siteKey || TURNSTILE_ENV.siteKey;
+  const secret = stored.secret || TURNSTILE_ENV.secret;
+  return {
+    siteKey,
+    secret,
+    enabled: Boolean(siteKey && secret),
+    secretSet: Boolean(stored.secret),
+    fromEnv: !stored.siteKey && !stored.secret,
+    verifyUrl: TURNSTILE_ENV.verifyUrl,
+  };
+}
+
+/** 给设置页看的现状；secret 本身不出网关。 */
+function turnstileView() {
+  const t = turnstileNow();
+  return { enabled: t.enabled, siteKey: t.siteKey, secretSet: t.secretSet, fromEnv: t.fromEnv };
+}
+
 function serveStatic(res, pathname) {
   const file = pathname === "/" ? "index.html" : pathname.slice(1);
   const full = join(WEB, file);
@@ -549,7 +583,7 @@ function serveStatic(res, pathname) {
     "x-content-type-options": "nosniff",
     "referrer-policy": "same-origin",
   };
-  if (extname(full) === ".html" || pathname === "/") headers["content-security-policy"] = PANEL_CSP;
+  if (extname(full) === ".html" || pathname === "/") headers["content-security-policy"] = panelCsp(turnstileNow().enabled);
   res.writeHead(200, headers);
   res.end(readFileSync(full));
   return true;
@@ -557,7 +591,9 @@ function serveStatic(res, pathname) {
 
 async function handleApi(req, res, url, sess) {
   if (url.pathname === "/api/setup" && req.method === "GET") {
-    return json(res, 200, { needed: !users.hasAdmin() });
+    // 登录页在登录前就要知道要不要画 Turnstile，所以站点密钥走这个无需登录的接口
+    const t = turnstileNow();
+    return json(res, 200, { needed: !users.hasAdmin(), turnstileSiteKey: t.enabled ? t.siteKey : "" });
   }
   if (url.pathname === "/api/setup" && req.method === "POST") {
     if (users.hasAdmin()) return json(res, 403, { error: "已完成初始化" });
@@ -581,6 +617,21 @@ async function handleApi(req, res, url, sess) {
       console.warn(`login blocked (rate limit) user=${body.username} ip=${ip}`);
       return json(res, 429, { error: "尝试次数过多，请 15 分钟后再试" });
     }
+    // 先过人机再验密码：token 一次性，挡住脚本爆破；验证失败不计入限流，
+    // 免得浏览器抽风重试几次把真人锁在门外。
+    const turnstile = turnstileNow();
+    if (turnstile.enabled) {
+      const verdict = await verifyTurnstile({
+        token: body.turnstileToken,
+        secret: turnstile.secret,
+        remoteip: ip === "unknown" ? "" : ip,
+        verifyUrl: turnstile.verifyUrl,
+      });
+      if (!verdict.ok) {
+        console.warn(`login turnstile reject reason=${verdict.reason} errors=${(verdict.errors || []).join(",")} user=${body.username} ip=${ip}`);
+        return json(res, 400, { error: "人机验证未通过，请重试" });
+      }
+    }
     const user = users.login(body.username, body.password);
     if (!user) {
       loginLimiter.fail(key);
@@ -602,13 +653,15 @@ async function handleApi(req, res, url, sess) {
     return json(res, 200, { ok: true });
   }
   if (!sess) return json(res, 401, { error: "未登录" });
-  if (url.pathname === "/api/me") return json(res, 200, { user: sess.user, settings: users.settings() });
-  if (url.pathname === "/api/settings" && req.method === "GET") return json(res, 200, { settings: users.settings() });
+  if (url.pathname === "/api/me") return json(res, 200, { user: sess.user, settings: users.settings(), turnstile: turnstileView() });
+  if (url.pathname === "/api/settings" && req.method === "GET") return json(res, 200, { settings: users.settings(), turnstile: turnstileView() });
   if (url.pathname === "/api/admin/settings" && req.method === "POST") {
     if (sess.user.role !== "admin") return json(res, 403, { error: "没有权限" });
     const body = await readBody(req);
     try {
-      return json(res, 200, { settings: users.setSettings(body) });
+      const settings = users.setSettings(body);
+      console.log(`settings saved by=${sess.user.username} turnstile=${turnstileNow().enabled ? "on" : "off"} ip=${clientIp(req)}`);
+      return json(res, 200, { settings, turnstile: turnstileView() });
     } catch (e) {
       return json(res, e.status || 400, { error: e.message });
     }

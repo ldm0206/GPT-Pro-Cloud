@@ -1,6 +1,6 @@
 import { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createUserStore } from "../lib/users.mjs";
@@ -93,7 +93,7 @@ describe("users + presence", () => {
     assert.equal(store.deskCdpOn("a"), false);
     assert.equal(store.deskCdpOn("b"), false);
     assert.equal(store.assistOn("a"), false);
-    assert.deepEqual(store.settings(), { vncFrameRate: 30 });
+    assert.deepEqual(store.settings(), { vncFrameRate: 30, turnstileSiteKey: "" });
     assert.throws(() => store.setDeskCdp("a", true), /多人分屏暂未开放/);
     assert.equal(store.deskCdpOn("a"), false);
     assert.equal(store.assistOn("a"), false);
@@ -119,7 +119,7 @@ describe("users + presence", () => {
     assert.equal(s.deskCdpOn("b"), false);
     assert.equal(s.assistOn("a"), false);
     assert.equal(s.assistOn("b"), false);
-    assert.deepEqual(s.settings(), { vncFrameRate: 30 });
+    assert.deepEqual(s.settings(), { vncFrameRate: 30, turnstileSiteKey: "" });
   });
 
   it("stores the global VNC frame rate and reloads it", () => {
@@ -127,17 +127,59 @@ describe("users + presence", () => {
     const file = join(dir, "users.json");
     const a = createUserStore({ file, adminUser: "admin", adminPassword: "admin-secret", deskIds: ["a"] });
     assert.equal(a.settings().vncFrameRate, 30);
-    assert.deepEqual(a.setSettings({ vncFrameRate: 15 }), { vncFrameRate: 15 });
+    assert.deepEqual(a.setSettings({ vncFrameRate: 15 }), { vncFrameRate: 15, turnstileSiteKey: "" });
     assert.equal(a.settings().vncFrameRate, 15);
     assert.throws(() => a.setSettings({ vncFrameRate: 31 }), /15 \/ 24 \/ 30 \/ 60/);
     assert.equal(a.settings().vncFrameRate, 15);
     const b = createUserStore({ file, adminUser: "admin", adminPassword: "admin-secret", deskIds: ["a"] });
     assert.equal(b.settings().vncFrameRate, 15);
-    assert.deepEqual(b.setSettings({}), { vncFrameRate: 15 });
+    assert.deepEqual(b.setSettings({}), { vncFrameRate: 15, turnstileSiteKey: "" });
     const legacy = join(dir, "legacy.json");
     writeFileSync(legacy, JSON.stringify({ users: [], settings: { assist: true } }));
     const c = createUserStore({ file: legacy, adminUser: "admin", adminPassword: "admin-secret", deskIds: ["a"] });
     assert.equal(c.settings().vncFrameRate, 30);
+  });
+
+  it("keeps the Turnstile pair in settings and never hands out the secret", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gpc-turnstile-"));
+    const file = join(dir, "users.json");
+    const a = createUserStore({ file, adminUser: "admin", adminPassword: "admin-secret", deskIds: ["a"] });
+    assert.deepEqual(a.turnstileKeys(), { siteKey: "", secret: "" });
+    assert.equal(a.settings().turnstileSiteKey, "");
+
+    const saved = a.setSettings({ turnstileSiteKey: "0x4AAAAAAA-site", turnstileSecret: "0x4AAAAAAA-secret" });
+    assert.equal(saved.turnstileSiteKey, "0x4AAAAAAA-site");
+    assert.equal(saved.turnstileSecret, undefined);
+    assert.deepEqual(a.turnstileKeys(), { siteKey: "0x4AAAAAAA-site", secret: "0x4AAAAAAA-secret" });
+
+    // 密钥栏留空 = 不改密钥
+    assert.equal(a.setSettings({ turnstileSiteKey: "0x4AAAAAAA-site2" }).turnstileSiteKey, "0x4AAAAAAA-site2");
+    assert.deepEqual(a.turnstileKeys(), { siteKey: "0x4AAAAAAA-site2", secret: "0x4AAAAAAA-secret" });
+    // 帧率和 Turnstile 互不干扰
+    assert.deepEqual(a.setSettings({ vncFrameRate: 15 }), { vncFrameRate: 15, turnstileSiteKey: "0x4AAAAAAA-site2" });
+    assert.equal(a.turnstileKeys().secret, "0x4AAAAAAA-secret");
+
+    // 只填一半是配不出半套的
+    assert.throws(() => a.setSettings({ turnstileSiteKey: "", turnstileSecret: "0x4AAAAAAA-secret" }), /一起填/);
+    assert.throws(() => a.setSettings({ turnstileSiteKey: "0x4AAAAAAA-new", turnstileSecret: "" }), /一起填/);
+    assert.equal(a.turnstileKeys().siteKey, "0x4AAAAAAA-site2");
+    assert.throws(() => a.setSettings({ turnstileSiteKey: "0x4AAAAAAA site" }), /空格/);
+    // 站点密钥敲成空白又留着旧密钥 = 拒绝，不会把人机验证悄悄关掉
+    assert.throws(() => a.setSettings({ turnstileSiteKey: "   " }), /一起填/);
+    assert.equal(a.turnstileKeys().siteKey, "0x4AAAAAAA-site2");
+
+    // 两个都清空 = 恢复用 .env
+    assert.equal(a.setSettings({ turnstileSiteKey: "", turnstileSecret: "" }).turnstileSiteKey, "");
+    assert.deepEqual(a.turnstileKeys(), { siteKey: "", secret: "" });
+
+    const b = createUserStore({ file, adminUser: "admin", adminPassword: "admin-secret", deskIds: ["a"] });
+    assert.equal(b.settings().turnstileSiteKey, "");
+    a.setSettings({ turnstileSiteKey: "0x4AAAAAAA-site", turnstileSecret: "0x4AAAAAAA-secret" });
+    const c = createUserStore({ file, adminUser: "admin", adminPassword: "admin-secret", deskIds: ["a"] });
+    assert.deepEqual(c.turnstileKeys(), { siteKey: "0x4AAAAAAA-site", secret: "0x4AAAAAAA-secret" });
+    const onDisk = JSON.parse(readFileSync(file, "utf8"));
+    assert.equal(onDisk.settings.turnstile.siteKey, "0x4AAAAAAA-site");
+    assert.equal(onDisk.settings.turnstile.secret, "0x4AAAAAAA-secret");
   });
 
   it("lets admin reset a password, revoke desks and disable login", () => {

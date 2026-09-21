@@ -21,7 +21,75 @@ async function api(path, opts = {}) {
   return data;
 }
 
-const state = { me: null, desks: [], presence: {}, users: [], settings: {}, proxyPresets: [], view: "home", deskId: null, deskMode: "vnc", seatId: null, err: "", modal: false, manage: null, rename: null, create: false, assign: null, resetPw: null, selfPw: false, seatCap: 3, setup: false, boot: true };
+const state = { me: null, desks: [], presence: {}, users: [], settings: {}, proxyPresets: [], view: "home", deskId: null, deskMode: "vnc", seatId: null, err: "", modal: false, manage: null, rename: null, create: false, assign: null, resetPw: null, selfPw: false, seatCap: 3, setup: false, boot: true, turnstileSiteKey: "", turnstile: { enabled: false, siteKey: "", secretSet: false, fromEnv: false } };
+
+/** Cloudflare Turnstile on the login form — only when the gateway is configured for it. */
+let turnstileApi = null;
+let turnstileWidget = 0;
+let turnstileToken = "";
+let turnstileBroken = false;
+
+function loadTurnstile() {
+  if (turnstileApi) return turnstileApi;
+  turnstileApi = new Promise((resolve, reject) => {
+    if (window.turnstile) return resolve(window.turnstile);
+    const s = document.createElement("script");
+    s.src = "https://challenges.cloudflare.com/turnstile/v0/api.js";
+    s.async = true;
+    s.onload = () => (window.turnstile ? resolve(window.turnstile) : reject(new Error("人机验证组件缺失")));
+    s.onerror = () => reject(new Error("人机验证脚本被拦截，登录不可用"));
+    document.head.appendChild(s);
+  });
+  return turnstileApi;
+}
+
+function dropTurnstile() {
+  turnstileToken = "";
+  const id = turnstileWidget;
+  turnstileWidget = 0;
+  if (id && window.turnstile) {
+    try {
+      window.turnstile.remove(id);
+    } catch {
+      /* 已经被这次重渲染摘掉了 */
+    }
+  }
+}
+
+/** 每次重画登录框都要换一个 widget：token 一次有效，提交失败后必须重新拿。 */
+function mountTurnstile() {
+  dropTurnstile();
+  if (!state.turnstileSiteKey || turnstileBroken) return;
+  const slot = $("#cf-slot");
+  if (!slot) return;
+  loadTurnstile()
+    .then((api) => {
+      if (!$("#cf-slot")) return; // 脚本加载期间已经离开登录页
+      turnstileWidget = api.render(slot, {
+        sitekey: state.turnstileSiteKey,
+        theme: "light",
+        callback: (token) => {
+          turnstileToken = token;
+          const err = $("#err");
+          // 只清掉「请先完成人机验证」这条提示，别把登录失败的原因一起抹了
+          if (err && err.textContent === "请先完成人机验证") err.textContent = "";
+        },
+        "error-callback": () => {
+          turnstileToken = "";
+          const err = $("#err");
+          if (err) err.textContent = "人机验证出错，请再试一次";
+        },
+        "expired-callback": () => {
+          turnstileToken = "";
+        },
+      });
+    })
+    .catch((err) => {
+      turnstileBroken = true;
+      state.err = err.message;
+      render();
+    });
+}
 
 function deskCdpOn(_id) {
   return false;
@@ -119,6 +187,7 @@ function renderBoot() {
 }
 
 function renderLogin() {
+  const cf = state.turnstileSiteKey ? `<div class="cf-slot" id="cf-slot"></div>` : "";
   return `<div class="auth">
     <div class="auth-brand">${MARK}<span>GPT&#8209;Pro Cloud</span></div>
     <form class="auth-card" id="login-form">
@@ -127,6 +196,7 @@ function renderLogin() {
       <div class="err" id="err">${esc(state.err)}</div>
       <label class="field"><span>用户名</span><span class="inwrap">${ICO.user}<input name="username" autocomplete="username" autofocus required></span></label>
       <label class="field"><span>密码</span><span class="inwrap">${ICO.lock}<input name="password" type="password" autocomplete="current-password" required></span></label>
+      ${cf}
       <button class="btn lg block" type="submit">登录</button>
     </form>
     <p class="auth-foot">账号由管理员分配</p>
@@ -416,8 +486,16 @@ function sharedProxyValue() {
   return state.proxyPresets[0] || "";
 }
 
+function turnstileStatus() {
+  const t = state.turnstile || {};
+  if (t.enabled) return t.fromEnv ? "已开启，密钥来自 .env —— 在这里保存一对即可接管" : "已开启，登录页会要求人机验证";
+  if (t.siteKey) return "只填了站点密钥，还要填密钥才会生效";
+  return "未开启，登录页只验用户名密码";
+}
+
 function renderSettings() {
   if (state.me?.role !== "admin") return renderHome();
+  const t = state.turnstile || {};
   const presets = (state.proxyPresets || [])
     .map((u) => `<button type="button" class="chip" data-proxy-pick="${esc(u)}" title="${esc(u)}">${esc(u)}</button>`)
     .join("");
@@ -439,6 +517,25 @@ function renderSettings() {
       <div class="panel-head">
         <b>复制粘贴</b>
         <em>在桌面画面里直接 ⌘C / ⌘V，双向生效。独占 VNC 走整桌剪贴板（文字、截图、ChatGPT 生成图）。桌面里下载的文件留在容器内，不会存到你电脑上。</em>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <b>登录人机验证</b>
+        <em>Cloudflare Turnstile，挡掉脚本爆破登录。在 Cloudflare 面板 → Turnstile → 添加站点拿一对密钥（类型选「托管」）。站点密钥会显示在登录页，密钥只留在网关里校验。两个一起保存才生效，密钥栏留空表示不修改；两个都清空保存则恢复用 <code>.env</code> 里的值——由 <code>.env</code> 提供时，在这里清空关不掉它。</em>
+      </div>
+      <div class="proxy-row">
+        <div class="proxy-id"><b>站点密钥</b></div>
+        <input class="proxy-input" id="ts-site" value="${esc(t.siteKey)}" placeholder="0x4AAAAA…" autocomplete="off" spellcheck="false">
+        <button type="button" class="btn ghost" id="ts-save">保存</button>
+      </div>
+      <div class="proxy-row">
+        <div class="proxy-id"><b>密钥</b></div>
+        <input class="proxy-input" id="ts-secret" type="password" value="" placeholder="${t.secretSet ? "已保存，留空则不修改" : "0x4AAAAA…"}" autocomplete="new-password" spellcheck="false">
+      </div>
+      <div class="proxy-row">
+        <div class="proxy-id"><b>状态</b></div>
+        <span class="hint">${esc(turnstileStatus())}</span>
       </div>
     </section>
     <section class="panel">
@@ -670,6 +767,7 @@ function render() {
   if (state.view === "login" || !state.me) {
     root.innerHTML = renderLogin();
     $("#login-form").onsubmit = onLogin;
+    if (state.turnstileSiteKey) mountTurnstile();
     return;
   }
   if (state.view === "desk") {
@@ -1734,6 +1832,22 @@ function bind() {
       await refresh();
     };
   });
+  const tsSave = $("#ts-save");
+  if (tsSave)
+    tsSave.onclick = async () => {
+      const body = { turnstileSiteKey: $("#ts-site")?.value ?? "", turnstileSecret: $("#ts-secret")?.value ?? "" };
+      tsSave.disabled = true;
+      try {
+        const r = await api("/api/admin/settings", { method: "POST", body });
+        state.settings = { ...state.settings, ...(r.settings || {}) };
+        state.turnstile = r.turnstile || state.turnstile;
+        toast(state.turnstile.enabled ? "人机验证已开启，登录页立即生效" : "人机验证已关闭，登录页只验用户名密码");
+        render();
+      } catch (err) {
+        toast(err.message || "没保存成功");
+        tsSave.disabled = false;
+      }
+    };
   document.querySelectorAll("[data-fps]").forEach((btn) => {
     btn.onclick = async () => {
       const fps = Number(btn.getAttribute("data-fps"));
@@ -1950,15 +2064,31 @@ async function onLogin(e) {
   e.preventDefault();
   state.err = "";
   const fd = new FormData(e.target);
+  if (state.turnstileSiteKey && !turnstileToken) {
+    state.err = "请先完成人机验证";
+    render();
+    return;
+  }
   try {
     const { user } = await api("/api/login", {
       method: "POST",
-      body: { username: fd.get("username"), password: fd.get("password") },
+      body: { username: fd.get("username"), password: fd.get("password"), turnstileToken: turnstileToken },
     });
+    dropTurnstile();
     state.me = user;
     await refresh();
     setHash("/");
   } catch (err) {
+    // 管理员可能刚打开人机验证：把站点密钥取回来，重画出验证框，别把人卡在死路上
+    if (!state.turnstileSiteKey && String(err.message || "").includes("人机验证")) {
+      const s = await api("/api/setup").catch(() => null);
+      if (s?.turnstileSiteKey) {
+        state.turnstileSiteKey = s.turnstileSiteKey;
+        state.err = "请先完成人机验证再登录";
+        render();
+        return;
+      }
+    }
     state.err = err.message;
     render();
   }
@@ -1968,6 +2098,7 @@ async function refresh() {
   const [me, desks, presence] = await Promise.all([api("/api/me"), api("/api/desks"), api("/api/presence")]);
   state.me = me.user;
   state.settings = me.settings || {};
+  state.turnstile = me.turnstile || state.turnstile;
   state.desks = desks.desks;
   state.proxyPresets = desks.proxyPresets || [];
   state.seatCap = desks.seatCap || state.seatCap || 3;
@@ -2021,6 +2152,7 @@ window.addEventListener("hashchange", () => {
   render();
   try {
     const s = await api("/api/setup");
+    state.turnstileSiteKey = s.turnstileSiteKey || "";
     if (s.needed) {
       state.setup = true;
       state.boot = false;

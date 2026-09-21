@@ -261,6 +261,7 @@ describe("standalone product", () => {
     const css = readFileSync(resolve(root, "gateway/web/app.css"), "utf8");
     assert.match(css, /\.fps-pick/);
     assert.match(css, /\.fps-row/);
+    assert.match(css, /\.cf-slot/);
     const panelHead = css.slice(css.indexOf(".panel-head {"), css.indexOf(".panel-head b"));
     assert.match(panelHead, /padding:\s*1[89]px\s+20px\s*;/);
     assert.doesNotMatch(panelHead, /padding:\s*18px\s+20px\s+4px/);
@@ -526,5 +527,58 @@ describe("standalone product", () => {
     assert.match(uiDeskCdp, /return false/);
     assert.match(ui, /if \(deskCdpOn\(state\.deskId\)\) ensureWorkspace\(\)/);
     assert.doesNotMatch(ui, /data-cdp-toggle/);
+  });
+
+  it("gates login behind Cloudflare Turnstile when both keys are set", () => {
+    const gw = readFileSync(resolve(root, "gateway/server.mjs"), "utf8");
+    const ui = readFileSync(resolve(root, "gateway/web/app.js"), "utf8");
+    const turnstile = readFileSync(resolve(root, "lib/turnstile.mjs"), "utf8");
+    assert.match(turnstile, /challenges\.cloudflare\.com\/turnstile\/v0\/siteverify/);
+    assert.match(turnstile, /enabled: Boolean\(siteKey && secret\)/);
+    assert.match(turnstile, /missing-token/);
+    assert.match(turnstile, /unreachable/);
+    assert.match(gw, /turnstileConfig/);
+    assert.match(gw, /verifyTurnstile/);
+    assert.match(gw, /TURNSTILE_SITE_KEY/);
+    assert.match(gw, /TURNSTILE_SECRET_KEY/);
+    assert.match(gw, /turnstileSiteKey/);
+    assert.match(gw, /users\.turnstileKeys\(\)/);
+    // 只有开启时才把 Cloudflare 加进 CSP，默认部署仍是全 'self'
+    const cspBlock = gw.slice(gw.indexOf("const PANEL_CSP"), gw.indexOf("function turnstileNow"));
+    assert.match(cspBlock, /function panelCsp\(turnstileOn\)/);
+    assert.match(cspBlock, /"script-src 'self'"/);
+    assert.match(cspBlock, /"frame-src 'self'"/);
+    assert.match(cspBlock, /https:\/\/challenges\.cloudflare\.com/);
+    // 静态文件按当前开关取 CSP，管理员改完密钥不用重启网关
+    assert.match(gw, /panelCsp\(turnstileNow\(\)\.enabled\)/);
+    const loginBlock = gw.slice(gw.indexOf('url.pathname === "/api/login"'), gw.indexOf('url.pathname === "/api/logout"'));
+    assert.match(loginBlock, /await verifyTurnstile/);
+    assert.match(loginBlock, /人机验证未通过/);
+    assert.match(ui, /challenges\.cloudflare\.com\/turnstile\/v0\/api\.js/);
+    assert.match(ui, /cf-slot/);
+    assert.match(ui, /turnstileToken/);
+    assert.match(ui, /请先完成人机验证/);
+    assert.match(ui, /\.render\(slot, \{/);
+    const settingsStart = ui.indexOf("function renderSettings");
+    const settingsBlock = ui.slice(settingsStart, ui.indexOf("const isMac", settingsStart));
+    assert.match(settingsBlock, /id="ts-site"/);
+    assert.match(settingsBlock, /id="ts-secret"/);
+    assert.match(settingsBlock, /id="ts-save"/);
+    assert.match(settingsBlock, /t\.siteKey/);
+    assert.match(settingsBlock, /t\.secretSet/);
+    assert.match(ui, /turnstileSiteKey: \$\("#ts-site"\)/);
+    assert.match(ui, /turnstileSecret: \$\("#ts-secret"\)/);
+    const compose = readFileSync(resolve(root, "docker-compose.yml"), "utf8");
+    assert.match(compose, /TURNSTILE_SITE_KEY=\$\{TURNSTILE_SITE_KEY:-\}/);
+    assert.match(compose, /TURNSTILE_SECRET_KEY=\$\{TURNSTILE_SECRET_KEY:-\}/);
+    const env = readFileSync(resolve(root, ".env.example"), "utf8");
+    assert.match(env, /TURNSTILE_SITE_KEY=/);
+    assert.match(env, /TURNSTILE_SECRET_KEY=/);
+    assert.match(readFileSync(resolve(root, "package.json"), "utf8"), /turnstile\.test\.mjs/);
+    for (const name of ["README.md", "README.zh-CN.md"]) {
+      const doc = readFileSync(resolve(root, name), "utf8");
+      assert.match(doc, /TURNSTILE_SITE_KEY/);
+      assert.match(doc, /TURNSTILE_SECRET_KEY/);
+    }
   });
 });

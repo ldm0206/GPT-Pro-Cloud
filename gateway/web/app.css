@@ -210,6 +210,10 @@ button { cursor: pointer; }
 .auth-card > .hint { margin-bottom: 22px; }
 .auth-card .btn { margin-top: 8px; }
 .auth-foot { color: var(--mute); font-size: 13px; margin: 0; }
+/* Cloudflare Turnstile widget, drawn by CF into #cf-slot */
+.cf-slot { margin: 0 0 14px; min-height: 65px; }
+.cf-slot:empty { display: none; }
+.cf-slot iframe { border: 0; max-width: 100%; }
 
 /* App frame */
 .app { min-height: 100%; display: flex; flex-direction: column; }
